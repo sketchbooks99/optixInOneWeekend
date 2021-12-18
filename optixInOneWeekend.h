@@ -80,26 +80,40 @@ struct MeshData
     // メッシュの頂点
     float3* vertices;
     // 三角形を構成するための頂点番号3点
-    uint3*   index;
+    uint3* indices;
 };
 
 struct LambertianData {
     // Lambert マテリアルの色
-    float3 color;
+    void* texture_data;
+    unsigned int texture_prg_id;
 };
 
 struct DielectricData {
     // 誘電体の色
-    float3 color; 
+    void* texture_data;
+    unsigned int texture_prg_id;
     // 屈折率
     float ior; 
 };
 
 struct MetalData {
     // 金属の色
-    float3 color; 
+    void* texture_data;
+    unsigned int texture_prg_id;
     // 金属の疑似粗さを指定するパラメータ
     float fuzz;
+};
+
+struct ConstantData
+{
+    float4 color;
+};
+
+struct CheckerData
+{
+    float4 color1; 
+    float4 color2;
 };
 
 struct HitGroupData
