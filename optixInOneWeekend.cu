@@ -63,6 +63,11 @@ struct RadiancePRD
     Material material;
 };
 
+struct SurfaceRecord
+{
+    
+};
+
 //------------------------------------------------------------------------------
 //
 //

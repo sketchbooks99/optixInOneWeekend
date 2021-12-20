@@ -954,7 +954,7 @@ void createPipeline(OneWeekendState& state)
     // Continuation callableは使用していないので、0でよい
     uint32_t max_cc_depth = 0;
     // Direct callableの呼び出し深度は最大でも2回 (マテリアル -> テクスチャ)
-    uint32_t max_dc_depth = 2;
+    uint32_t max_dc_depth = 3;
     uint32_t direct_callable_stack_size_from_traversable;
     uint32_t direct_callable_stack_size_from_state;
     uint32_t continuation_stack_size;
@@ -1189,7 +1189,7 @@ void createScene(OneWeekendState& state)
         }
     }
     
-    // Glass
+    // Dielectric
     spheres.emplace_back(SphereData{ make_float3(0.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo1{ make_float4(1.0f) };
     DielectricData material1{ copyDataToDevice(albedo1, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f };
@@ -1227,7 +1227,6 @@ void createScene(OneWeekendState& state)
     std::vector<uint3> mesh_indices;
     std::vector<uint32_t> mesh_sbt_indices;
     uint32_t mesh_index = 0;
-    uint32_t mesh_sbt_index = 0;
     for (int a = 0; a < 100; a++) {
         float3 center{rnd(seed) * 20.0f - 10.0f, 0.5f + rnd(seed) * 1.0f - 0.5f, rnd(seed) * 20.0f - 10.0f };
         const float3 p0 = center + make_float3(rnd(seed) * 0.5f, -rnd(seed) * 0.5f, rnd(seed) * 0.5f - 0.25f);
@@ -1241,16 +1240,20 @@ void createScene(OneWeekendState& state)
         mesh_index += 3;
     }
 
+    const uint32_t red_sbt_index = 0;
+    const uint32_t green_sbt_index = 1;
+    const uint32_t blue_sbt_index = 2;
+
     // ランダムで赤・緑・青の3色を割り振る
     for (const auto& face : mesh_indices)
     {
         const float choose_rgb = rnd(seed);
         if (choose_rgb < 0.33f)
-            mesh_sbt_indices.push_back(mesh_sbt_index++);
+            mesh_sbt_indices.push_back(red_sbt_index);
         else if (choose_rgb < 0.67f)
-            mesh_sbt_indices.push_back(mesh_sbt_index++);
+            mesh_sbt_indices.push_back(green_sbt_index);
         else
-            mesh_sbt_indices.push_back(mesh_sbt_index++);
+            mesh_sbt_indices.push_back(blue_sbt_index);
     }
 
     // メッシュ用のGASを作成
