@@ -40,6 +40,7 @@
 // ディレクトリへのパスなどの環境変数が定義されている
 #include <sampleConfig.h>
 
+// OptiX SDK 提供のヘッダーファイルのinclude
 #include <sutil/CUDAOutputBuffer.h>
 #include <sutil/Camera.h>
 #include <sutil/Exception.h>
@@ -66,16 +67,22 @@
 bool resize_dirty   = false;
 bool minimized      = false;
 
-// Camera state 
+// カメラ
 bool camera_changed = true;
 sutil::Camera    camera;
 sutil::Trackball trackball;
 
-// Mouse state
+// マウス
 int32_t mouse_button = -1;
 
+// 1度のカーネル起動におけるピクセルあたりのサンプル数
 int32_t samples_per_launch = 16;
 
+// Shader binding tableを構成するシェーダーレコードでヘッダーと任意のデータからなる。
+// ヘッダーサイズはOptiX 7.4ではOPTIX_SBT_RECORD_HEADER_SIZE (32 bytes)で固定の値である。
+// データはユーザー定義のデータ型を格納することが可能。ただし、Shader binding table内で
+// 複数のレコードを保持できるHitGroup record, Miss record, Callables recordはそれぞれで
+// レコードサイズが等しい必要がある。
 template <typename T>
 struct Record 
 {
@@ -85,14 +92,22 @@ struct Record
 
 using RayGenRecord   = Record<RayGenData>;
 using MissRecord     = Record<MissData>;
-using HitGroupRecord = Record<HitGroupRecord>;
+using HitGroupRecord = Record<HitGroupData>;
+using EmptyRecord    = Record<EmptyData>;
 
+// Direct/Continuation callable プログラムをデバイス(GPU)側で呼ぶには、
+// OptixDeviceContextが作られてから、Callableプログラムが作られた順番(ID)
+// が必要なので、プログラム作成時にIDを紐づけておく
 struct CallableProgram
 {
     OptixProgramGroup program = nullptr;
     uint32_t          id      = 0;
 };
 
+// Geometry acceleration structure (GAS) 用
+// GASのtraversable handleをOptixInstanceに紐づける際に、
+// GASが保持するSBT recordの数がわかると、
+// Instanceのsbt offsetを一括で構築しやすい
 struct GeometryAccelData
 {
     OptixTraversableHandle handle;
@@ -100,6 +115,8 @@ struct GeometryAccelData
     uint32_t num_sbt_records;
 };
 
+// Instance acceleration structure (IAS) 用
+// 
 struct InstanceAccelData
 {
     OptixTraversableHandle handle;
@@ -107,25 +124,9 @@ struct InstanceAccelData
     CUdeviceptr d_instances_buffer;
 };
 
-struct Primitive
-{
-    ShapeType shape_type;
-    HitGroupData hitgroup_data;
-};
-
-struct Scene
-{
-    float4 background;
-
-    sutil::Camera camera;
-    sutil::Trackball trackball;
-
-    std::vector<Primitive> primitives;
-};
-
 enum class ShapeType
 {
-    Mesh,
+    Mesh, 
     Sphere
 };
 
@@ -133,34 +134,50 @@ struct OneWeekendState
 {
     OptixDeviceContext context = 0;
 
-    // Instance Acceleration Structure の Traversable handle
-    OptixTraversableHandle      traversable_handle       = 0;
-    CUdeviceptr                 d_ias_output_buffer      = 0;
+    // シーン全体のInstance acceleration structure
+    InstanceAccelData           ias                      = {};
+    // GPU上におけるシーンの球体データ全てを格納している配列のポインタ
     void*                       d_sphere_data            = nullptr;
+    // GPU上におけるシーンの三角形データ全てを格納している配列のポインタ
     void*                       d_mesh_data              = nullptr;
 
     OptixModule                 module                   = nullptr;
     OptixPipelineCompileOptions pipeline_compile_options = {};
     OptixPipeline               pipeline                 = nullptr;
 
+    // Ray generation プログラム 
     OptixProgramGroup           raygen_prg               = nullptr;
+    // Miss プログラム
     OptixProgramGroup           miss_prg                 = nullptr;
+
+    // 球体用のHitGroup プログラム
     OptixProgramGroup           sphere_hitgroup_prg      = nullptr;
+    // メッシュ用のHitGroupプログラム
     OptixProgramGroup           mesh_hitgroup_prg        = nullptr;
 
-    // Callable programs for materials
+    // マテリアル用のCallableプログラム
+    // OptiXでは基底クラスのポインタを介した、派生クラスの関数呼び出し (ポリモーフィズム)が
+    // 禁止されているため、Callable関数を使って疑似的なポリモーフィズムを実現する
+    // ここでは、Lambertian, Dielectric, Metal の3種類を実装している
     CallableProgram             lambertian_prg           = {};
     CallableProgram             dielectric_prg           = {};
     CallableProgram             metal_prg                = {};
 
-    // Callable programs for textures
+    // テクスチャ用のCallableプログラム
+    // Constant ... 単色、Checker ... チェッカーボード
     CallableProgram             constant_prg             = {};
     CallableProgram             checker_prg              = {};
 
+    // CUDA stream
     CUstream                    stream                   = 0;
+
+    // Pipeline launch parameters
+    // CUDA内で extern "C" __constant__ Params params
+    // と宣言することで、全モジュールからアクセス可能である。
     Params                      params;
     Params*                     d_params;
 
+    // Shader binding table
     OptixShaderBindingTable     sbt                      = {};
 };
 
@@ -191,14 +208,14 @@ static void cursorPosCallback(GLFWwindow* window, double xpos, double ypos)
     if (mouse_button == GLFW_MOUSE_BUTTON_LEFT)
     {
         trackball.setViewMode(sutil::Trackball::LookAtFixed);
-        trackball.updateTracking(static_cast<int>(xpos), static_cast<int>(ypos), params.width, params.height);
+        trackball.updateTracking(static_cast<int>(xpos), static_cast<int>(ypos), params->width, params->height);
         camera_changed = true;
     }
     // 右クリック中にマウスが移動した場合は、カメラの原点を固定して注視点を動かす
     else if (mouse_button == GLFW_MOUSE_BUTTON_RIGHT)
     {
         trackball.setViewMode(sutil::Trackball::EyeFixed);
-        trackball.updateTracking(static_cast<int>(xpos), static_cast<int>(ypos), params->width, params.height);
+        trackball.updateTracking(static_cast<int>(xpos), static_cast<int>(ypos), params->width, params->height);
         camera_changed = true;
     }
 }
@@ -253,12 +270,12 @@ static void scrollCallback( GLFWwindow* window, double xscroll, double yscroll )
 // -----------------------------------------------------------------------
 OptixAabb sphereBound(const SphereData& sphere)
 {
+    // 球体のAxis-aligned bounding box (AABB)を返す
     const float3 center = sphere.center;
     const float radius = sphere.radius;
-    // SphereのAxis-aligned bounding box を返す
     return OptixAabb {
-        center.x - radius, center.y - radius, center.z - radius, 
-        center.x + radius, center.y + radius, center.z + radius
+        /* minX = */ center.x - radius, /* minY = */ center.y - radius, /* minZ = */ center.z - radius, 
+        /* maxX = */ center.x + radius, /* maxY = */ center.y + radius, /* maxZ = */ center.z + radius
     };
 }
 
@@ -275,6 +292,8 @@ void printUsageAndExit(const char* argv0)
 }
 
 // -----------------------------------------------------------------------
+// Pipeline launch parameterの初期化
+// -----------------------------------------------------------------------
 void initLaunchParams( OneWeekendState& state )
 {
     CUDA_CHECK(cudaMalloc(
@@ -285,13 +304,18 @@ void initLaunchParams( OneWeekendState& state )
 
     state.params.samples_per_launch = samples_per_launch;
     state.params.subframe_index = 0u;
+    state.params.max_depth = 5;
 
-    state.params.handle = state.ias_handle;
+    // レイトレーシングを行うASのtraversableHandleを設定
+    state.params.handle = state.ias.handle;
 
     CUDA_CHECK(cudaStreamCreate(&state.stream));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state.d_params), sizeof(Params)));
 }
 
+// -----------------------------------------------------------------------
+// カメラの更新処理
+// マウス入力等でカメラが動いた際にlaunch parameterも更新する
 // -----------------------------------------------------------------------
 void handleCameraUpdate( Params& params )
 {
@@ -304,6 +328,9 @@ void handleCameraUpdate( Params& params )
     camera.UVWFrame(params.U, params.V, params.W);
 }
 
+// -----------------------------------------------------------------------
+// ウィンドウサイズが変化したときの処理
+// レイトレーシングによる計算結果を格納するバッファを更新する
 // -----------------------------------------------------------------------
 void handleResize( sutil::CUDAOutputBuffer<uchar4>& output_buffer, Params& params )
 {
@@ -322,6 +349,8 @@ void handleResize( sutil::CUDAOutputBuffer<uchar4>& output_buffer, Params& param
 }
 
 // -----------------------------------------------------------------------
+// カメラとウィンドウサイズの変化を監視
+// -----------------------------------------------------------------------
 void updateState( sutil::CUDAOutputBuffer<uchar4>& output_buffer, Params& params )
 {
     // Update params on device
@@ -333,9 +362,10 @@ void updateState( sutil::CUDAOutputBuffer<uchar4>& output_buffer, Params& params
 }
 
 // -----------------------------------------------------------------------
+// optixLaunchを呼び出し、デバイス側のレイトレーシングカーネルを起動
+// -----------------------------------------------------------------------
 void launchSubframe( sutil::CUDAOutputBuffer<uchar4>& output_buffer, OneWeekendState& state )
 {
-    // Launch
     uchar4* result_buffer_data = output_buffer.map();
     state.params.frame_buffer  = result_buffer_data;
     CUDA_CHECK( cudaMemcpyAsync(
@@ -359,6 +389,8 @@ void launchSubframe( sutil::CUDAOutputBuffer<uchar4>& output_buffer, OneWeekendS
 }
 
 // -----------------------------------------------------------------------
+// OpenGLを介してレンダリング結果を描画
+// -----------------------------------------------------------------------
 void displaySubframe( sutil::CUDAOutputBuffer<uchar4>& output_buffer, sutil::GLDisplay& gl_display, GLFWwindow* window )
 {
     // Display
@@ -375,15 +407,27 @@ void displaySubframe( sutil::CUDAOutputBuffer<uchar4>& output_buffer, sutil::GLD
 }
 
 // -----------------------------------------------------------------------
+// デバイス側からのメッセージを取得するためのCallable関数
+// OptixDeviceContextを生成する際に、
+// OptixDeviceContext::logCallbackFunctionに登録する
+// -----------------------------------------------------------------------
 static void contextLogCallback(uint32_t level, const char* tag, const char* msg, void* /* callback_data */)
 {
     std::cerr << "[" << std::setw(2) << level << "][" << std::setw(12) << tag << "]: " << msg << "\n";
 }
 
 // -----------------------------------------------------------------------
-void initCamera(sutil::Camera& camera, sutil::Trackball& trackball)
+// カメラの初期化
+// -----------------------------------------------------------------------
+void initCameraState()
 {
     camera_changed = true;
+
+    camera.setEye(make_float3(13.0f, 2.0f, 3.0f));
+    camera.setLookat(make_float3(0.0f, 0.0f, 0.0f));
+    camera.setUp(make_float3(0.0f, 1.0f, 0.0f));
+    camera.setFovY(20.0f);
+    camera.setAspectRatio(3.0f / 2.0f);
 
     trackball.setCamera(&camera);
     trackball.setMoveSpeed(10.0f);
@@ -396,6 +440,8 @@ void initCamera(sutil::Camera& camera, sutil::Trackball& trackball)
 }
 
 // -----------------------------------------------------------------------
+// OptixDeviceContextの初期化
+// -----------------------------------------------------------------------
 void createContext( OneWeekendState& state )
 {
     // CUDAの初期化
@@ -406,12 +452,21 @@ void createContext( OneWeekendState& state )
     OPTIX_CHECK( optixInit() );
     OptixDeviceContextOptions options = {};
     options.logCallbackFunction  = &contextLogCallback;
+    // Callbackで取得するメッセージのレベル
+    // 0 ... disable、メッセージを受け取らない
+    // 1 ... fatal、修復不可能なエラー。コンテクストやOptiXが不能状態にある
+    // 2 ... error、修復可能エラー。
+    // 3 ... warning、意図せぬ挙動や低パフォーマンスを導くような場合に警告してくれる
+    // 4 ... print、全メッセージを受け取る
     options.logCallbackLevel     = 4;
     OPTIX_CHECK( optixDeviceContextCreate( cu_ctx, &options, &context ) );
 
     state.context = context;
 }
 
+// -----------------------------------------------------------------------
+// 重複のないインデックスの個数を数える
+// 例) { 0, 0, 0, 1, 1, 2, 2, 2 } -> 3 
 // -----------------------------------------------------------------------
 uint32_t getNumSbtRecords(const std::vector<uint32_t>& sbt_indices)
 {
@@ -425,6 +480,8 @@ uint32_t getNumSbtRecords(const std::vector<uint32_t>& sbt_indices)
     return static_cast<uint32_t>(sbt_counter.size());
 }
 
+// -----------------------------------------------------------------------
+// Geometry acceleration structureの構築
 // -----------------------------------------------------------------------
 void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& build_input)
 {
@@ -480,7 +537,6 @@ void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& 
     {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gas.d_output_buffer), compacted_gas_size));
 
-        // use handle as input and output
         OPTIX_CHECK(optixAccelCompact(state.context, 0, gas.handle, gas.d_output_buffer, compacted_gas_size, &gas.handle));
 
         CUDA_CHECK(cudaFree((void*)d_buffer_temp_output_gas_and_compacted_size));
@@ -492,11 +548,14 @@ void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& 
 }
 
 // -----------------------------------------------------------------------
+// Mesh用のGASを構築
+// デバイス側のポインタ(state.d_mesh_data)へのデータコピーも同時に行う
+// -----------------------------------------------------------------------
 void buildMeshGAS(
     OneWeekendState& state, 
     GeometryAccelData& gas,
     const std::vector<float3>& vertices, 
-    const std::vector<int3>& indices, 
+    const std::vector<uint3>& indices, 
     const std::vector<uint32_t>& sbt_indices
 )
 {
@@ -510,16 +569,22 @@ void buildMeshGAS(
     ));
 
     CUdeviceptr d_indices = 0;
-    const size_t indices_size = indices.size() * sizeof(int3);
+    const size_t indices_size = indices.size() * sizeof(uint3);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_indices), indices_size));
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void*>(d_indices),
         indices.data(), indices_size, 
         cudaMemcpyHostToDevice 
     ));
+    
+    MeshData mesh_data{reinterpret_cast<float3*>(d_vertices), reinterpret_cast<uint3*>(d_indices) };
+    CUDA_CHECK(cudaMalloc(&state.d_mesh_data, sizeof(MeshData)));
+    CUDA_CHECK(cudaMemcpy(
+        state.d_mesh_data, &mesh_data, sizeof(MeshData), cudaMemcpyHostToDevice
+    ));
 
     CUdeviceptr d_sbt_indices = 0;
-    const size_t sbt_indices_size = sbt_indices.size() * sizeof(int32_t);
+    const size_t sbt_indices_size = sbt_indices.size() * sizeof(uint32_t);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_sbt_indices), sbt_indices_size));
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void**>(d_sbt_indices),
@@ -528,6 +593,7 @@ void buildMeshGAS(
     ));
 
     uint32_t num_sbt_records = getNumSbtRecords(sbt_indices);
+    gas.num_sbt_records = num_sbt_records;
 
     uint32_t* input_flags = new uint32_t[num_sbt_records];
     for (uint32_t i = 0; i < num_sbt_records; i++)
@@ -542,6 +608,7 @@ void buildMeshGAS(
     mesh_input.triangleArray.flags = input_flags;
     mesh_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     mesh_input.triangleArray.indexStrideInBytes = sizeof(uint3);
+    mesh_input.triangleArray.indexBuffer = d_indices;
     mesh_input.triangleArray.numIndexTriplets = static_cast<uint32_t>(indices.size());
     mesh_input.triangleArray.numSbtRecords = num_sbt_records;
     mesh_input.triangleArray.sbtIndexOffsetBuffer = d_sbt_indices;
@@ -551,6 +618,9 @@ void buildMeshGAS(
     buildGAS(state, gas, mesh_input);
 }
 
+// -----------------------------------------------------------------------
+// Sphere用のGASを構築
+// デバイス側のポインタ(state.d_sphere_data)へのデータコピーも同時に行う
 // -----------------------------------------------------------------------
 void buildSphereGAS(
     OneWeekendState& state, 
@@ -580,7 +650,13 @@ void buildSphereGAS(
         cudaMemcpyHostToDevice
     ));
 
+    CUDA_CHECK(cudaMalloc(&state.d_sphere_data, sizeof(SphereData) * spheres.size()));
+    CUDA_CHECK(cudaMemcpy(
+        state.d_sphere_data, spheres.data(), sizeof(SphereData) * spheres.size(), cudaMemcpyHostToDevice
+    ));
+
     uint32_t num_sbt_records = getNumSbtRecords(sbt_indices);
+    gas.num_sbt_records = num_sbt_records;
 
     uint32_t* input_flags = new uint32_t[num_sbt_records];
     for (uint32_t i = 0; i < num_sbt_records; i++)
@@ -599,6 +675,8 @@ void buildSphereGAS(
     buildGAS(state, gas, sphere_input);
 }
 
+// -----------------------------------------------------------------------
+// Instance acceleration structureの構築
 // -----------------------------------------------------------------------
 void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<OptixInstance>& instances)
 {
@@ -662,6 +740,8 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
 }
 
 // -----------------------------------------------------------------------
+// OptixModuleの作成
+// -----------------------------------------------------------------------
 void createModule(OneWeekendState& state)
 {
     OptixModuleCompileOptions module_compile_options = {};
@@ -670,9 +750,9 @@ void createModule(OneWeekendState& state)
     module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 
     state.pipeline_compile_options.usesMotionBlur = false;
-    state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+    state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
     state.pipeline_compile_options.numPayloadValues = 2;
-    state.pipeline_compile_options.numAttributeValues = 2;
+    state.pipeline_compile_options.numAttributeValues = 5;
 #ifdef DEBUG // Enables debug exceptions during optix launches. This may incur significant performance cost and should only be done during development.
     state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_DEBUG | OPTIX_EXCEPTION_FLAG_TRACE_DEPTH | OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW;
 #else
@@ -681,7 +761,7 @@ void createModule(OneWeekendState& state)
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 
     size_t      inputSize = 0;
-    const char* input = sutil::getInputData(OPTIX_SAMPLE_NAME, OPTIX_SAMPLE_DIR, "optixPathTracer.cu", inputSize);
+    const char* input = sutil::getInputData(OPTIX_SAMPLE_NAME, OPTIX_SAMPLE_DIR, "optixInOneWeekend.cu", inputSize);
 
     char   log[2048];
     size_t sizeof_log = sizeof(log);
@@ -697,6 +777,8 @@ void createModule(OneWeekendState& state)
     ));
 }
 
+// -----------------------------------------------------------------------
+// 全ProgramGroupの作成
 // -----------------------------------------------------------------------
 void createProgramGroups(OneWeekendState& state)
 {
@@ -728,7 +810,7 @@ void createProgramGroups(OneWeekendState& state)
         OptixProgramGroupDesc miss_prg_desc = {};
         miss_prg_desc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
         miss_prg_desc.miss.module = state.module;
-        miss_prg_desc.miss.entryFunctionName = "__miss__constant";
+        miss_prg_desc.miss.entryFunctionName = "__miss__radiance";
         sizeof_log = sizeof(log);
 
         OPTIX_CHECK_LOG(optixProgramGroupCreate(
@@ -762,7 +844,6 @@ void createProgramGroups(OneWeekendState& state)
 
         // Sphere
         memset(&hitgroup_prg_desc, 0, sizeof(OptixProgramGroupDesc));
-        OptixProgramGroupDesc hitgroup_prg_desc = {};
         hitgroup_prg_desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
         hitgroup_prg_desc.hitgroup.moduleIS = state.module;
         hitgroup_prg_desc.hitgroup.entryFunctionNameIS = "__intersection__sphere";
@@ -802,7 +883,7 @@ void createProgramGroups(OneWeekendState& state)
         callables_id++;
     };
 
-    // Callables programs for materials
+    // マテリアル用のCallableプログラム
     {
         // Lambertian
         createDirectCallables(state.lambertian_prg, "__direct_callable__lambertian");
@@ -812,7 +893,7 @@ void createProgramGroups(OneWeekendState& state)
         createDirectCallables(state.metal_prg, "__direct_callable__metal");
     }
 
-    // Callable programs for textures
+    // テクスチャ用のCallableプログラム
     {
         // Constant texture
         createDirectCallables(state.constant_prg, "__direct_callable__constant");
@@ -821,6 +902,8 @@ void createProgramGroups(OneWeekendState& state)
     }
 }
 
+// -----------------------------------------------------------------------
+// OptixPipelineの作成
 // -----------------------------------------------------------------------
 void createPipeline(OneWeekendState& state)
 {
@@ -865,7 +948,7 @@ void createPipeline(OneWeekendState& state)
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.constant_prg.program, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.checker_prg.program, &stack_sizes));
 
-    uint32_t max_trace_depth = 2;
+    uint32_t max_trace_depth = 5;
     uint32_t max_cc_depth = 0;
     uint32_t max_dc_depth = 3;
     uint32_t direct_callable_stack_size_from_traversable;
@@ -881,7 +964,7 @@ void createPipeline(OneWeekendState& state)
         &continuation_stack_size
     ));
 
-    const uint32_t max_traversal_depth = 1;
+    const uint32_t max_traversal_depth = 5;
     OPTIX_CHECK(optixPipelineSetStackSize(
         state.pipeline, 
         direct_callable_stack_size_from_traversable, 
@@ -892,7 +975,7 @@ void createPipeline(OneWeekendState& state)
 }
 
 // -----------------------------------------------------------------------
-void createSBT(OneWeekendState& state, const std::vector<Primitive>& primitives)
+void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, HitGroupData>>& hitgroup_datas)
 {
     CUdeviceptr d_raygen_record;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_raygen_record), sizeof(RayGenRecord)));
@@ -922,18 +1005,19 @@ void createSBT(OneWeekendState& state, const std::vector<Primitive>& primitives)
     ));
 
     CUdeviceptr d_hitgroup_records;
-    const size_t hitgroup_record_size = sizeof(HitGroupRecord) * primitives.size();
+    const size_t hitgroup_record_size = sizeof(HitGroupRecord) * hitgroup_datas.size();
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_hitgroup_records), hitgroup_record_size));
 
-    HitGroupRecord* hitgroup_records = new HitGroupRecord[primitives.size()];
-    for (size_t i = 0; i < primitives.size(); i++)
+    HitGroupRecord* hitgroup_records = new HitGroupRecord[hitgroup_datas.size()];
+    for (size_t i = 0; i < hitgroup_datas.size(); i++)
     {
-        Primitive p = primitives[i];
-        if (p.shape_type == ShapeType::Mesh)
+        ShapeType type = hitgroup_datas[i].first;
+        HitGroupData data = hitgroup_datas[i].second;
+        if (type == ShapeType::Mesh)
             OPTIX_CHECK(optixSbtRecordPackHeader(state.mesh_hitgroup_prg, &hitgroup_records[i]));
-        else if (p.shape_type == ShapeType::Sphere)
+        else if (type == ShapeType::Sphere)
             OPTIX_CHECK(optixSbtRecordPackHeader(state.sphere_hitgroup_prg, &hitgroup_records[i]));
-        hitgroup_records[i].data = p.hitgroup_data;
+        hitgroup_records[i].data = data;
     }
 
     CUDA_CHECK(cudaMemcpy(
@@ -943,13 +1027,34 @@ void createSBT(OneWeekendState& state, const std::vector<Primitive>& primitives)
         cudaMemcpyHostToDevice
     ));
 
+    EmptyRecord* callables_records = new EmptyRecord[5];
+    CUdeviceptr d_callables_records;
+    const size_t callables_record_size = sizeof(EmptyRecord) * 5;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_callables_records), callables_record_size));
+
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.lambertian_prg.program, &callables_records[0]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.dielectric_prg.program, &callables_records[1]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.metal_prg.program, &callables_records[2]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.constant_prg.program, &callables_records[3]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.checker_prg.program, &callables_records[4]));
+
+    CUDA_CHECK(cudaMemcpy(
+        reinterpret_cast<void*>(d_callables_records),
+        callables_records,
+        callables_record_size,
+        cudaMemcpyHostToDevice
+    ));
+
     state.sbt.raygenRecord = d_raygen_record;
     state.sbt.missRecordBase = d_miss_record;
     state.sbt.missRecordStrideInBytes = static_cast<uint32_t>(sizeof(MissRecord));
     state.sbt.missRecordCount = 1;
     state.sbt.hitgroupRecordBase = d_hitgroup_records;
     state.sbt.hitgroupRecordStrideInBytes = static_cast<uint32_t>(sizeof(HitGroupRecord));
-    state.sbt.hitgroupRecordCount = static_cast<uint32_t>(primitives.size());
+    state.sbt.hitgroupRecordCount = static_cast<uint32_t>(hitgroup_datas.size());
+    state.sbt.callablesRecordBase = d_callables_records;
+    state.sbt.callablesRecordCount = 5;
+    state.sbt.callablesRecordStrideInBytes = sizeof(EmptyRecord);
 }
 
 // -----------------------------------------------------------------------
@@ -975,10 +1080,10 @@ void finalizeState(OneWeekendState& state)
 void createScene(OneWeekendState& state)
 {
     // Return device side pointer of data
-    auto createDeviceData = [](auto data, size_t size) -> void*
+    auto copyDataToDevice = [](auto data, size_t size) -> void*
     {
         CUdeviceptr device_ptr;
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_ptr), size)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_ptr), size));
         CUDA_CHECK(cudaMemcpy(
             reinterpret_cast<void*>(device_ptr),
             &data, size,
@@ -987,30 +1092,19 @@ void createScene(OneWeekendState& state)
         return reinterpret_cast<void*>(device_ptr);
     };
 
-    auto createHitGroupData = [](auto shape, auto material, uint32_t material_prg_id) -> HitGroupData
-    {
-        void* shape_data = createDeviceData(shape, sizeof(shape));
-        void* material_data = createDeviceData(material, sizeof(material));
-        return HitGroupData{ shape_data, material_data, material_prg_id };
-    };
-
     uint32_t sbt_index = 0;
+    std::vector<std::pair<ShapeType, HitGroupData>> hitgroup_datas;
+    std::vector<Material> materials;
 
-    // Sphere
+    // Spheres
     std::vector<SphereData> spheres;
     std::vector<uint32_t> sphere_sbt_indices;
-    // Mesh
-    std::vector<float3> mesh_vertices;
-    std::vector<int3> mesh_indices;
-
-    // Primitives
-    std::vector<Primitive> primitives;
 
     SphereData ground_sphere{ make_float3(0, -1000, 0), 1000 };
     spheres.emplace_back(ground_sphere);
-    CheckerData ground_checker{ make_float4(1.0f), make_float4(0.2f, 0.5f, 0.2f, 1.0f) };
-    LambertianData ground_lambert{ createDeviceData(ground_checker, sizeof(CheckerData)), state.checker_prg.id };
-    primitives.emplace_back( ShapeType::Sphere, createHitGroupData( ground_sphere, ground_lambert, state.lambertian_prg.id ) );
+    CheckerData ground_checker{ make_float4(1.0f), make_float4(0.2f, 0.5f, 0.2f, 1.0f), 5000};
+    LambertianData ground_lambert{ copyDataToDevice(ground_checker, sizeof(CheckerData)), state.checker_prg.id };
+    materials.push_back(Material{ copyDataToDevice(ground_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
     sphere_sbt_indices.emplace_back(sbt_index++);
     
     uint32_t seed = tea<4>(0, 0);
@@ -1022,68 +1116,144 @@ void createScene(OneWeekendState& state)
             const float3 center{ a + 0.9f * rnd(seed), 0.2f, b + 0.9f * rnd(seed) };
             if (length(center - make_float3(4, 0.2, 0)) > 0.9f)
             {
-                spheres.emplace_back( /* center = */ center, /* radius = */ 0.2f);
+                spheres.emplace_back( SphereData { center, 0.2f });
                 sphere_sbt_indices.emplace_back(sbt_index++);
                 if (choose_mat < 0.8f)
                 {
                     // Lambertian
                     ConstantData albedo{ make_float4(rnd(seed), rnd(seed), rnd(seed), 1.0f) };
-                    LambertianData lambertian{ createDeviceData(albedo, sizeof(ConstantData)), state.constant_prg.id };
-                    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), lambertian, state.lambertian_prg.id));
+                    LambertianData lambertian{ copyDataToDevice(albedo, sizeof(ConstantData)), state.constant_prg.id };
+                    materials.emplace_back(Material{ copyDataToDevice(lambertian, sizeof(LambertianData)), state.lambertian_prg.id });
                 }
                 else if (choose_mat < 0.95f)
                 {
                     // Metal
                     ConstantData albedo{ make_float4(0.5f + rnd(seed) * 0.5f) };
-                    MetalData metal{ createDeviceData(albedo, sizeof(ConstantData)), state.constant_prg.id, /* fuzz = */ rnd(seed) * 0.5f};
-                    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), metal, state.metal_prg.id));
+                    MetalData metal{ copyDataToDevice(albedo, sizeof(ConstantData)), state.constant_prg.id, /* fuzz = */ rnd(seed) * 0.5f};
+                    materials.emplace_back(Material{ copyDataToDevice(metal, sizeof(MetalData)), state.metal_prg.id });
                 }
                 else
                 {
                     // glass
                     ConstantData albedo{ make_float4(1.0f) };
-                    DielectricData glass{ createDeviceData(albedo, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f};
-                    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), glass, state.dielectric_prg.id));
+                    DielectricData glass{ copyDataToDevice(albedo, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f};
+                    materials.emplace_back(Material{ copyDataToDevice(glass, sizeof(DielectricData)), state.dielectric_prg.id });
                 }
             }
         }
     }
     
     // Glass
+    spheres.emplace_back(SphereData{ make_float3(0.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo1{ make_float4(1.0f) };
-    DielectricData material1{ createDeviceData(albedo1, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f };
-    spheres.emplace_back( /* center = */ make_float3(0.0f, 1.0f, 0.0f), /* radius = */ 1.0f);
-    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), material1, state.dielectric_prg.id));
+    DielectricData material1{ copyDataToDevice(albedo1, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f };
+    materials.push_back(Material{ copyDataToDevice(material1, sizeof(DielectricData)), state.dielectric_prg.id });
     sphere_sbt_indices.emplace_back(sbt_index++);
 
     // Lambertian
+    spheres.emplace_back(SphereData{ make_float3(-4.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo2{ make_float4(0.4f, 0.2f, 0.1f, 1.0f) };
-    LambertianData material2{ createDeviceData(albedo2, sizeof(ConstantData)), state.constant_prg.id };
-    spheres.emplace_back( /* center = */ make_float3(-4.0f, 1.0f, 0.0f), /* radius = */ 1.0f);
-    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), material2, state.lambertian_prg.id));
+    LambertianData material2{ copyDataToDevice(albedo2, sizeof(ConstantData)), state.constant_prg.id };
+    materials.push_back(Material{ copyDataToDevice(material2, sizeof(LambertianData)), state.lambertian_prg.id });
     sphere_sbt_indices.emplace_back(sbt_index++);
 
     // Metal
+    spheres.emplace_back(SphereData{ make_float3(4.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo3{ make_float4(0.7f, 0.6f, 0.5f, 1.0f) };
-    MetalData material3{ createDeviceData(albedo3, sizeof(ConstantData)), state.constant_prg.id };
-    spheres.emplace_back( /* center = */ make_float3(4.0f, 1.0f, 0.0f), /* radius = */ 1.0f);
-    primitives.emplace_back(ShapeType::Sphere, createHitGroupData(spheres.back(), material3, state.metal_prg.id));
+    MetalData material3{ copyDataToDevice(albedo3, sizeof(ConstantData)), state.constant_prg.id };
+    materials.emplace_back(Material{ copyDataToDevice(material3, sizeof(MetalData)), state.metal_prg.id });
     sphere_sbt_indices.emplace_back(sbt_index++);
 
-    // Create accleration structure
+    // Create geometry accleration structure for sphere
     GeometryAccelData sphere_gas;
     buildSphereGAS(state, sphere_gas, spheres, sphere_sbt_indices);
-    state.traversable_handle = sphere_gas.handle;
 
-    createSBT(state, primitives);
+    for (auto& m : materials)
+        hitgroup_datas.emplace_back(ShapeType::Sphere, HitGroupData{state.d_sphere_data, m});
+
+    // Meshes
+    std::vector<float3> mesh_vertices;
+    std::vector<uint3> mesh_indices;
+    std::vector<uint32_t> mesh_sbt_indices;
+    uint32_t mesh_index = 0;
+    uint32_t mesh_sbt_index = 0;
+    for (int a = 0; a < 100; a++) {
+        float3 center{rnd(seed) * 20.0f - 10.0f, 0.5f + rnd(seed) * 1.0f - 0.5f, rnd(seed) * 20.0f - 10.0f };
+        const float3 p0 = center + make_float3(rnd(seed) * 0.5f, -rnd(seed) * 0.5f, rnd(seed) * 0.5f - 0.25f);
+        const float3 p1 = center + make_float3(-rnd(seed) * 0.5f, -rnd(seed) * 0.5f, rnd(seed) * 0.5f - 0.25f);
+        const float3 p2 = center + make_float3(rnd(seed) * 0.25f, rnd(seed) * 0.5f, rnd(seed) * 0.5f - 0.25f);
+
+        mesh_vertices.emplace_back(p0);
+        mesh_vertices.emplace_back(p1);
+        mesh_vertices.emplace_back(p2);
+        mesh_indices.emplace_back(make_uint3(mesh_index + 0, mesh_index + 1, mesh_index + 2));
+        mesh_index += 3;
+    }
+
+    const uint32_t red_sbt_index = 0;
+    const uint32_t green_sbt_index = 1;
+    const uint32_t blue_sbt_index = 2;
+
+    for (const auto& face : mesh_indices)
+    {
+        const float choose_rgb = rnd(seed);
+        if (choose_rgb < 0.33f)
+            mesh_sbt_indices.push_back(red_sbt_index);
+        else if (choose_rgb < 0.67f)
+            mesh_sbt_indices.push_back(green_sbt_index);
+        else
+            mesh_sbt_indices.push_back(blue_sbt_index);
+    }
+
+    GeometryAccelData mesh_gas;
+    buildMeshGAS(state, mesh_gas, mesh_vertices, mesh_indices, mesh_sbt_indices);
+
+    ConstantData red{ {0.8f, 0.05f, 0.05f, 1.0f} };
+    LambertianData red_lambert{ copyDataToDevice(red, sizeof(ConstantData)), state.constant_prg.id };
+    materials.emplace_back(Material{ copyDataToDevice(red_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
+    hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
+
+    ConstantData green{ {0.05f, 0.8f, 0.05f, 1.0f} };
+    LambertianData green_lambert{ copyDataToDevice(green, sizeof(ConstantData)), state.constant_prg.id };
+    materials.emplace_back(Material{ copyDataToDevice(green_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
+    hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
+
+    ConstantData blue{ {0.05f, 0.05f, 0.8f, 1.0f} };
+    LambertianData blue_lambert{ copyDataToDevice(blue, sizeof(ConstantData)), state.constant_prg.id };
+    materials.emplace_back(Material{ copyDataToDevice(blue_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
+    hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
+
+    InstanceAccelData scene_ias;
+    std::vector<OptixInstance> instances;
+    uint32_t flags = OPTIX_INSTANCE_FLAG_NONE;
+
+    uint32_t sbt_offset = 0;
+    uint32_t instance_id = 0;
+    instances.emplace_back(OptixInstance{
+        {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, instance_id, sbt_offset, 255, 
+        flags, sphere_gas.handle, {0, 0}
+    });
+
+    sbt_offset += sphere_gas.num_sbt_records;
+    instance_id++;
+    const float c = cosf(M_PIf / 6.0f);
+    const float s = sinf(M_PIf / 6.0f);
+    instances.push_back(OptixInstance{
+        {c, 0, s, 0, 0, 1, 0, 0, -s, 0, c, 0}, instance_id, sbt_offset, 255,
+        flags, mesh_gas.handle, {0, 0}
+    });
+
+    buildIAS(state, state.ias, instances);
+
+    createSBT(state, hitgroup_datas);
 }
 
 // -----------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
     OneWeekendState state;
-    state.params.width = 768;
-    state.params.height = 768;
+    state.params.width = 1200;
+    state.params.height = static_cast<int>(1200.0f / (3.0f / 2.0f));
     sutil::CUDAOutputBufferType output_buffer_type = sutil::CUDAOutputBufferType::GL_INTEROP;
 
     std::string outfile;
@@ -1120,6 +1290,8 @@ int main(int argc, char* argv[])
 
     try
     {
+        initCameraState();
+
         createContext(state);
         createModule(state);
         createProgramGroups(state);
@@ -1201,7 +1373,10 @@ int main(int argc, char* argv[])
 
             handleCameraUpdate(state.params);
             handleResize(output_buffer, state.params);
-            launchSubframe(output_buffer, state);
+            for (int i = 0; i < 1024; i += samples_per_launch) {
+                launchSubframe(output_buffer, state);
+                state.params.subframe_index++;
+            }
 
             sutil::ImageBuffer buffer;
             buffer.data = output_buffer.getHostPointer();

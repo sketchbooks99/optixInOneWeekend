@@ -27,7 +27,7 @@
 //
 #include <optix.h>
 
-#include "optixPathTracer.h"
+#include "optixInOneWeekend.h"
 #include "random.h"
 
 #include <sutil/vec_math.h>
@@ -38,7 +38,6 @@ __constant__ Params params;
 }
 
 
-
 //------------------------------------------------------------------------------
 //
 //
@@ -47,56 +46,22 @@ __constant__ Params params;
 
 struct RadiancePRD
 {
-    // TODO: move some state directly into payload registers?
     float3       emitted;
     float3       radiance;
     float3       attenuation;
     float3       origin;
     float3       direction;
+    float3       normal; 
+    float2       texcoord;
+
     unsigned int seed;
     int          countEmitted;
     int          done;
     int          pad;
 
     // マテリアル用のデータとCallablesプログラムのID
-    void* material_data;
-    int material_prg_id;
+    Material material;
 };
-
-
-struct Onb
-{
-  __forceinline__ __device__ Onb(const float3& normal)
-  {
-    m_normal = normal;
-
-    if( fabs(m_normal.x) > fabs(m_normal.z) )
-    {
-      m_binormal.x = -m_normal.y;
-      m_binormal.y =  m_normal.x;
-      m_binormal.z =  0;
-    }
-    else
-    {
-      m_binormal.x =  0;
-      m_binormal.y = -m_normal.z;
-      m_binormal.z =  m_normal.y;
-    }
-
-    m_binormal = normalize(m_binormal);
-    m_tangent = cross( m_binormal, m_normal );
-  }
-
-  __forceinline__ __device__ void inverse_transform(float3& p) const
-  {
-    p = p.x*m_tangent + p.y*m_binormal + p.z*m_normal;
-  }
-
-  float3 m_tangent;
-  float3 m_binormal;
-  float3 m_normal;
-};
-
 
 //------------------------------------------------------------------------------
 //
@@ -127,25 +92,55 @@ static __forceinline__ __device__ RadiancePRD* getPRD()
     return reinterpret_cast<RadiancePRD*>( unpackPointer( u0, u1 ) );
 }
 
+static __forceinline__ __device__ float3 randomInUnitSphere(unsigned int& seed) {
+    const float phi = 2.0f * M_PIf * rnd(seed);
+    const float theta = acosf(1.0f - 2.0f * rnd(seed));
+    const float x = sinf(theta) * cosf(phi);
+    const float y = sinf(theta) * sinf(phi);
+    const float z = cosf(theta);
+    return make_float3(x, y, z);
+}
 
-static __forceinline__ __device__ void setPayloadOcclusion( bool occluded )
+static __forceinline__ __device__ float3 randomSampleHemisphere(unsigned int& seed, const float3& normal)
 {
-    optixSetPayload_0( static_cast<unsigned int>( occluded ) );
+    const float3 vec_in_sphere = randomInUnitSphere(seed);
+    if (dot(vec_in_sphere, normal) > 0.0f)
+        return vec_in_sphere;
+    else
+        return -vec_in_sphere;
+}
+
+static __forceinline__ __device__ float3 cosineSampleHemisphere(const float u1, const float u2)
+{
+    const float r = sqrtf(u2);
+    const float phi = 2.0f * M_PIf * u1;
+    const float x = r * cosf(phi);
+    const float y = r * sinf(phi);
+    const float z = sqrtf(1.0f - u2);
+    return make_float3(x, y, z);
 }
 
 
-static __forceinline__ __device__ void cosine_sample_hemisphere(const float u1, const float u2, float3& p)
+static __forceinline__ __device__ float fresnel(float cosine, float ref_idx)
 {
-  // Uniformly sample disk.
-  const float r   = sqrtf( u1 );
-  const float phi = 2.0f*M_PIf * u2;
-  p.x = r * cosf( phi );
-  p.y = r * sinf( phi );
-
-  // Project up to hemisphere.
-  p.z = sqrtf( fmaxf( 0.0f, 1.0f - p.x*p.x - p.y*p.y ) );
+    float r0 = (1 - ref_idx) / (1 + ref_idx);
+    r0 = r0 * r0;
+    return r0 + (1 - r0) * powf((1 - cosine), 5.0f);
 }
 
+static __forceinline__ __device__ float3 refract(const float3& uv, const float3& n, float etai_over_etat) {
+    auto cos_theta = fminf(dot(-uv, n), 1.0f);
+    float3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
+    float3 r_out_parallel = -sqrtf(fabs(1.0f - dot(r_out_perp, r_out_perp))) * n;
+    return r_out_perp + r_out_parallel;
+}
+
+static __forceinline__ __device__ float3 refract(const float3& wi, const float3& n, float cos_i, float ni, float nt) {
+    float nt_ni = nt / ni;
+    float ni_nt = ni / nt;
+    float D = sqrtf(nt_ni * nt_ni - (1.0f - cos_i * cos_i)) - cos_i;
+    return ni_nt * (wi - D * n);
+}
 
 static __forceinline__ __device__ void trace(
         OptixTraversableHandle handle,
@@ -169,9 +164,9 @@ static __forceinline__ __device__ void trace(
             0.0f,                // rayTime
             OptixVisibilityMask( 1 ),
             OPTIX_RAY_FLAG_NONE,
-            RAY_TYPE_RADIANCE,        // SBT offset
-            RAY_TYPE_COUNT,           // SBT stride
-            RAY_TYPE_RADIANCE,        // missSBTIndex
+            0,        // SBT offset
+            1,        // SBT stride
+            0,        // missSBTIndex
             u0, u1 );
 }
 
@@ -189,7 +184,7 @@ extern "C" __global__ void __raygen__pinhole()
     const float3 U = params.U;
     const float3 V = params.V; 
     const float3 W = params.W;
-    const idx = optixGetLaunchIndex();
+    const uint3 idx = optixGetLaunchIndex();
     const int subframe_index = params.subframe_index;
     const int samples_per_launch = params.samples_per_launch;
 
@@ -197,7 +192,6 @@ extern "C" __global__ void __raygen__pinhole()
     unsigned int seed = tea<4>(idx.y * w + idx.x, subframe_index);
 
     float3 result = make_float3(0.0f);
-
     for (int i = 0; i < samples_per_launch; i++)
     {
         const float2 subpixel_jitter = make_float2(rnd(seed), rnd(seed));
@@ -205,7 +199,7 @@ extern "C" __global__ void __raygen__pinhole()
         const float2 d = 2.0f * make_float2(
             ((float)idx.x + subpixel_jitter.x) / (float)w, 
             ((float)idx.y + subpixel_jitter.y) / (float)h
-        );
+        ) - 1.0f;
 
         // 光線の向きと原点を設定
         float3 ray_direction = normalize(d.x * U + d.y * V + W);
@@ -219,181 +213,230 @@ extern "C" __global__ void __raygen__pinhole()
         prd.done = false;
         prd.seed = seed;
 
+        float3 throughput = make_float3(1.0f);
+
         int depth = 0;
         for (;;)
         {
+            if (depth >= params.max_depth)
+                break;
+
             trace(params.handle, ray_origin, ray_direction, 0.01f, 1e16f, &prd);
+
+            if (prd.done) {
+                result += prd.emitted * throughput;
+                break;
+            }
 
             // Direct callable関数を使って各マテリアルにおける
             optixDirectCall<void, RadiancePRD*, void*>(
-                prd.material_prg_id, &prd, prd.material_data
+                prd.material.prg_id, &prd, prd.material.data
             );
-        }
-    }
-}
 
-extern "C" __global__ void __raygen__rg()
-{
-    const int    w   = params.width;
-    const int    h   = params.height;
-    const float3 eye = params.eye;
-    const float3 U   = params.U;
-    const float3 V   = params.V;
-    const float3 W   = params.W;
-    const uint3  idx = optixGetLaunchIndex();
-    const int    subframe_index = params.subframe_index;
+            throughput *= prd.attenuation;
 
-    unsigned int seed = tea<4>( idx.y*w + idx.x, subframe_index );
-
-    float3 result = make_float3( 0.0f );
-    int i = params.samples_per_launch;
-    do
-    {
-        // The center of each pixel is at fraction (0.5,0.5)
-        const float2 subpixel_jitter = make_float2( rnd( seed ), rnd( seed ) );
-
-        const float2 d = 2.0f * make_float2(
-                ( static_cast<float>( idx.x ) + subpixel_jitter.x ) / static_cast<float>( w ),
-                ( static_cast<float>( idx.y ) + subpixel_jitter.y ) / static_cast<float>( h )
-                ) - 1.0f;
-        float3 ray_direction = normalize(d.x*U + d.y*V + W);
-        float3 ray_origin    = eye;
-
-        RadiancePRD prd;
-        prd.emitted      = make_float3(0.f);
-        prd.radiance     = make_float3(0.f);
-        prd.attenuation  = make_float3(1.f);
-        prd.countEmitted = true;
-        prd.done         = false;
-        prd.seed         = seed;
-
-        int depth = 0;
-        for( ;; )
-        {
-            traceRadiance(
-                    params.handle,
-                    ray_origin,
-                    ray_direction,
-                    0.01f,  // tmin       // TODO: smarter offset
-                    1e16f,  // tmax
-                    &prd );
-
-            result += prd.emitted;
-            result += prd.radiance * prd.attenuation;
-
-            if( prd.done  || depth >= 3 ) // TODO RR, variable for depth
-                break;
-
-            ray_origin    = prd.origin;
+            ray_origin = prd.origin;
             ray_direction = prd.direction;
 
             ++depth;
         }
     }
-    while( --i );
 
-    const uint3    launch_index = optixGetLaunchIndex();
-    const unsigned int image_index  = launch_index.y * params.width + launch_index.x;
-    float3         accum_color  = result / static_cast<float>( params.samples_per_launch );
+    const unsigned int image_index = idx.y * params.width + idx.x;
+    float3 accum_color = result / static_cast<float>(params.samples_per_launch);
 
-    if( subframe_index > 0 )
+    if (subframe_index > 0)
     {
-        const float                 a = 1.0f / static_cast<float>( subframe_index+1 );
-        const float3 accum_color_prev = make_float3( params.accum_buffer[ image_index ]);
-        accum_color = lerp( accum_color_prev, accum_color, a );
+        const float a = 1.0f / static_cast<float>(subframe_index + 1);
+        const float3 accum_color_prev = make_float3(params.accum_buffer[image_index]);
+        accum_color = lerp(accum_color_prev, accum_color, a);
     }
-    params.accum_buffer[ image_index ] = make_float4( accum_color, 1.0f);
-    params.frame_buffer[ image_index ] = make_color ( accum_color );
+    params.accum_buffer[image_index] = make_float4(accum_color, 1.0f);
+    params.frame_buffer[image_index] = make_color(accum_color);
 }
-
 
 extern "C" __global__ void __miss__radiance()
 {
-    MissData* rt_data  = reinterpret_cast<MissData*>( optixGetSbtDataPointer() );
     RadiancePRD* prd = getPRD();
-
-    prd->radiance = make_float3( rt_data->bg_color );
+    const float3 unit_direction = normalize(optixGetWorldRayDirection());
+    const float t = 0.5f * (unit_direction.y + 1.0f);
+    prd->emitted = (1.0f - t) * make_float3(1.0f) + t * make_float3(0.5f, 0.7f, 1.0f);
     prd->done      = true;
 }
 
-
-extern "C" __global__ void __closesthit__occlusion()
+extern "C" __global__ void __closesthit__mesh()
 {
-    setPayloadOcclusion( true );
-}
-
-
-extern "C" __global__ void __closesthit__radiance()
-{
-    HitGroupData* rt_data = (HitGroupData*)optixGetSbtDataPointer();
+    HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
+    const MeshData* mesh_data = (MeshData*)data->shape_data;
 
     const int    prim_idx        = optixGetPrimitiveIndex();
-    const float3 ray_dir         = optixGetWorldRayDirection();
-    const int    vert_idx_offset = prim_idx*3;
+    const float3 direction         = optixGetWorldRayDirection();
+    const uint3 index = mesh_data->indices[prim_idx];
 
-    const float3 v0   = make_float3( rt_data->vertices[ vert_idx_offset+0 ] );
-    const float3 v1   = make_float3( rt_data->vertices[ vert_idx_offset+1 ] );
-    const float3 v2   = make_float3( rt_data->vertices[ vert_idx_offset+2 ] );
-    const float3 N_0  = normalize( cross( v1-v0, v2-v0 ) );
+    const float2 texcoord = optixGetTriangleBarycentrics();
 
-    const float3 N    = faceforward( N_0, -ray_dir, N_0 );
-    const float3 P    = optixGetWorldRayOrigin() + optixGetRayTmax()*ray_dir;
+    const float3 v0   = mesh_data->vertices[ index.x ];
+    const float3 v1   = mesh_data->vertices[ index.y ];
+    const float3 v2   = mesh_data->vertices[ index.z ];
+    const float3 N  = normalize( cross( v1-v0, v2-v0 ) );
+
+    const float3 P    = optixGetWorldRayOrigin() + optixGetRayTmax()*direction;
 
     RadiancePRD* prd = getPRD();
 
-    if( prd->countEmitted )
-        prd->emitted = rt_data->emission_color;
-    else
-        prd->emitted = make_float3( 0.0f );
+    prd->origin = P;
+    prd->direction = direction;
+    prd->normal = N;
+    prd->texcoord = texcoord;
+    prd->material = data->material;
+}
 
+extern "C" __global__ void __intersection__sphere()
+{
+    HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
+    const int prim_idx = optixGetPrimitiveIndex();
+    const SphereData sphere_data = ((SphereData*)data->shape_data)[prim_idx];
+
+    const float3 center = sphere_data.center;
+    const float radius = sphere_data.radius;
+
+    const float3 origin = optixGetObjectRayOrigin();
+    const float3 direction = optixGetObjectRayDirection();
+    const float tmin = optixGetRayTmin();
+    const float tmax = optixGetRayTmax();
+
+    const float3 oc = origin - center;
+    const float a = dot(direction, direction);
+    const float half_b = dot(oc, direction);
+    const float c = dot(oc, oc) - radius * radius;
+
+    const float discriminant = half_b * half_b - a * c;
+    if (discriminant < 0) return;
+    
+    const float sqrtd = sqrtf(discriminant);
+
+    float root = (-half_b - sqrtd) / a;
+    if (root < tmin || tmax < root)
+    {
+        root = (-half_b + sqrtd) / a;
+        if (root < tmin || tmax < root)
+            return;
+    }
+
+    const float3 P = origin + root * direction;
+    const float3 normal = (P - center) / radius;
+
+    float phi = atan2(normal.y, normal.x);
+    if (phi < 0) phi += 2.0f * M_PIf;
+    const float theta = acosf(normal.z);
+    const float2 texcoord = make_float2(phi / (2.0f * M_PIf), theta / M_PIf);
+
+    optixReportIntersection(root, 0, 
+        __float_as_int(normal.x), __float_as_int(normal.y), __float_as_int(normal.z),
+        __float_as_int(texcoord.x), __float_as_int(texcoord.y)
+    );
+}
+
+extern "C" __global__ void __closesthit__sphere()
+{
+    HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
+
+    const float3 local_n = make_float3(
+        __int_as_float(optixGetAttribute_0()),
+        __int_as_float(optixGetAttribute_1()),
+        __int_as_float(optixGetAttribute_2())
+    );
+    const float3 world_n = normalize(optixTransformNormalFromObjectToWorldSpace(local_n));
+
+    const float2 texcoord = make_float2(
+        __int_as_float(optixGetAttribute_3()),
+        __int_as_float(optixGetAttribute_4())
+    );
+
+    const float3 origin = optixGetWorldRayOrigin();
+    const float3 direction = optixGetWorldRayDirection();
+    const float3 P = origin + optixGetRayTmax() * direction;
+
+    RadiancePRD* prd = getPRD();
+    prd->origin = P;
+    prd->normal = world_n;
+    prd->direction = direction;
+    prd->texcoord = texcoord;
+    prd->material = data->material;
+}
+
+extern "C" __device__ void __direct_callable__lambertian(RadiancePRD* prd, void* material_data)
+{
+    const LambertianData* lambertian = (LambertianData*)material_data;
+    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
+        lambertian->texture_prg_id, prd, lambertian->texture_data
+        );
+    prd->attenuation = make_float3(color);
+
+    prd->normal = faceforward(prd->normal, -prd->direction, prd->normal);
 
     unsigned int seed = prd->seed;
+    float3 wi = randomSampleHemisphere(seed, prd->normal);
+    prd->direction = normalize(wi);
+    prd->done = false;
+    prd->emitted = make_float3(0.0f);
+}
 
-    {
-        const float z1 = rnd(seed);
-        const float z2 = rnd(seed);
+extern "C" __device__ void __direct_callable__dielectric(RadiancePRD* prd, void* material_data)
+{
+    const DielectricData* dielectric = (DielectricData*)material_data;
+    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
+        dielectric->texture_prg_id, prd, dielectric->texture_data
+        );
 
-        float3 w_in;
-        cosine_sample_hemisphere( z1, z2, w_in );
-        Onb onb( N );
-        onb.inverse_transform( w_in );
-        prd->direction = w_in;
-        prd->origin    = P;
+    const float ior = dielectric->ior;
+    const float3 in_direction = prd->direction;
 
-        prd->attenuation *= rt_data->diffuse_color;
-        prd->countEmitted = false;
-    }
+    prd->attenuation = make_float3(color);
+    float cos_theta = dot(in_direction, prd->normal);
+    bool into = cos_theta < 0;
+    const float3 outward_normal = into ? prd->normal : -prd->normal;
+    const float refraction_ratio = into ? (1.0 / ior) : ior;
 
-    const float z1 = rnd(seed);
-    const float z2 = rnd(seed);
+    float3 unit_direction = normalize(in_direction);
+    cos_theta = fabs(cos_theta);
+    float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+
+    unsigned int seed = prd->seed;
+    bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+    if (cannot_refract || rnd(seed) < fresnel(cos_theta, refraction_ratio))
+        prd->direction = reflect(unit_direction, prd->normal);
+    else
+        prd->direction = refract(unit_direction, outward_normal, refraction_ratio);
+    prd->done = false;
+    prd->emitted = make_float3(0.0f);
     prd->seed = seed;
+}
 
-    ParallelogramLight light = params.light;
-    const float3 light_pos = light.corner + light.v1 * z1 + light.v2 * z2;
+extern "C" __device__ void __direct_callable__metal(RadiancePRD* prd, void* material_data)
+{
+    const MetalData* metal = (MetalData*)material_data;
+    unsigned int seed = prd->seed;
+    prd->direction = reflect(prd->direction, prd->normal) + metal->fuzz * randomInUnitSphere(seed);
+    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
+        metal->texture_prg_id, prd, metal->texture_data
+        );
+    prd->attenuation = make_float3(color);
+    prd->done = false;
+    prd->emitted = make_float3(0.0f);
+    prd->seed = seed;
+}
 
-    // Calculate properties of light sample (for area based pdf)
-    const float  Ldist = length(light_pos - P );
-    const float3 L     = normalize(light_pos - P );
-    const float  nDl   = dot( N, L );
-    const float  LnDl  = -dot( light.normal, L );
+extern "C" __device__ float4 __direct_callable__constant(RadiancePRD* /* prd */ , void* texture_data)
+{
+    const ConstantData* constant = (ConstantData*)texture_data;
+    return constant->color;
+}
 
-    float weight = 0.0f;
-    if( nDl > 0.0f && LnDl > 0.0f )
-    {
-        const bool occluded = traceOcclusion(
-            params.handle,
-            P,
-            L,
-            0.01f,         // tmin
-            Ldist - 0.01f  // tmax
-            );
+extern "C" __device__ float4 __direct_callable__checker(RadiancePRD* prd, void* texture_data)
+{
+    const CheckerData* checker = (CheckerData*)texture_data;
+    const bool is_odd = sinf(prd->texcoord.x * M_PIf * checker->scale) * sinf(prd->texcoord.y * M_PIf * checker->scale) < 0;
+    return is_odd ? checker->color1 : checker->color2;
 
-        if( !occluded )
-        {
-            const float A = length(cross(light.v1, light.v2));
-            weight = nDl * LnDl * A / (M_PIf * Ldist * Ldist);
-        }
-    }
-
-    prd->radiance += light.emission * weight;
 }

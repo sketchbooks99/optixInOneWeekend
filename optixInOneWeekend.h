@@ -26,13 +26,6 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 
-enum RayType
-{
-    RAY_TYPE_RADIANCE  = 0,
-    RAY_TYPE_OCCLUSION = 1,
-    RAY_TYPE_COUNT
-};
-
 struct Params
 {
     unsigned int subframe_index;
@@ -41,6 +34,7 @@ struct Params
     unsigned int width;
     unsigned int height;
     unsigned int samples_per_launch;
+    unsigned int max_depth;
 
     float3       eye;
     float3       U;
@@ -105,6 +99,11 @@ struct MetalData {
     float fuzz;
 };
 
+struct Material {
+    void* data; 
+    unsigned int prg_id;
+};
+
 struct ConstantData
 {
     float4 color;
@@ -114,6 +113,7 @@ struct CheckerData
 {
     float4 color1; 
     float4 color2;
+    float scale;
 };
 
 struct HitGroupData
@@ -124,13 +124,20 @@ struct HitGroupData
     // 異なるデータ型の構造体を追加したいときに対応しやすくなる。
     void* shape_data;
 
-    // マテリアル(Lambertian, Glass, Metal)のデータ
-    // デバイス上に確保されたポインタを紐づけておく
-    // 物体形状同様に汎用ポインタを使う
-    void* material_data;
+    //// マテリアル(Lambertian, Glass, Metal)のデータ
+    //// デバイス上に確保されたポインタを紐づけておく
+    //// 物体形状同様に汎用ポインタを使う
+    //void* material_data;
 
-    // マテリアルにおける散乱方向や色を計算するためのCallablesプログラムのID
-    // OptiX 7.x では仮想関数が使えないので、Callablesプログラムを使って
-    // 疑似的なポリモーフィズムを実現する
-    unsigned int material_prg_id;
+    //// マテリアルにおける散乱方向や色を計算するためのCallablesプログラムのID
+    //// OptiX 7.x では仮想関数が使えないので、Callablesプログラムを使って
+    //// 疑似的なポリモーフィズムを実現する
+    //unsigned int material_prg_id;
+
+    Material material;
+};
+
+struct EmptyData
+{
+
 };
