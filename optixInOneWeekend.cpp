@@ -921,6 +921,7 @@ void createPipeline(OneWeekendState& state)
     };
 
     OptixPipelineLinkOptions pipeline_link_options = {};
+    // optixTrace()の呼び出し深度の設定
     pipeline_link_options.maxTraceDepth = 2;
     pipeline_link_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
 
@@ -937,6 +938,7 @@ void createPipeline(OneWeekendState& state)
         &state.pipeline
     ));
 
+    // 各プログラムからパイプラインによって構築されるCall graphのスタックサイズを計算
     OptixStackSizes stack_sizes = {};
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.raygen_prg, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.miss_prg, &stack_sizes));
@@ -948,9 +950,11 @@ void createPipeline(OneWeekendState& state)
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.constant_prg.program, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.checker_prg.program, &stack_sizes));
 
-    uint32_t max_trace_depth = 5;
+    uint32_t max_trace_depth = pipeline_link_options.maxTraceDepth;
+    // Continuation callableは使用していないので、0でよい
     uint32_t max_cc_depth = 0;
-    uint32_t max_dc_depth = 3;
+    // Direct callableの呼び出し深度は最大でも2回 (マテリアル -> テクスチャ)
+    uint32_t max_dc_depth = 2;
     uint32_t direct_callable_stack_size_from_traversable;
     uint32_t direct_callable_stack_size_from_state;
     uint32_t continuation_stack_size;
@@ -964,7 +968,10 @@ void createPipeline(OneWeekendState& state)
         &continuation_stack_size
     ));
 
-    const uint32_t max_traversal_depth = 5;
+    // Traversable graphの深度を設定する
+    // 今回のように IAS -> GAS だけで終わるのであれば、traversable graphの深度は2となる
+    // IAS -> Motion transform -> GAS となるようであれば、深度は3必要となる
+    const uint32_t max_traversal_depth = 2;
     OPTIX_CHECK(optixPipelineSetStackSize(
         state.pipeline, 
         direct_callable_stack_size_from_traversable, 
@@ -975,14 +982,18 @@ void createPipeline(OneWeekendState& state)
 }
 
 // -----------------------------------------------------------------------
+// Shader binding tableの構築
+// -----------------------------------------------------------------------
 void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, HitGroupData>>& hitgroup_datas)
 {
+    // Ray generation 
+    RayGenRecord raygen_record = {};
+    // RayGenRecordの領域をデバイス側に確保
     CUdeviceptr d_raygen_record;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_raygen_record), sizeof(RayGenRecord)));
-
-    RayGenRecord raygen_record = {};
+    // SBT recordのヘッダーをプログラムを使って埋める
     OPTIX_CHECK(optixSbtRecordPackHeader(state.raygen_prg, &raygen_record));
-
+    // RayGenRecordをデバイス側にコピー
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void*>(d_raygen_record),
         &raygen_record,
@@ -990,13 +1001,16 @@ void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, Hi
         cudaMemcpyHostToDevice
     ));
 
+    // Miss
+    MissRecord miss_record = {};
+    // MissRecordの領域をデバイス側に確保
     CUdeviceptr d_miss_record;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_miss_record), sizeof(MissRecord)));
-
-    MissRecord miss_record = {};
+    // SBT recordのヘッダーをプログラムを使って埋める
     OPTIX_CHECK(optixSbtRecordPackHeader(state.miss_prg, &miss_record));
+    // データを設定
     miss_record.data.bg_color = make_float4(0.0f);
-
+    // MissRecordをデバイス側にコピー
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void*>(d_miss_record),
         &miss_record,
@@ -1004,22 +1018,27 @@ void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, Hi
         cudaMemcpyHostToDevice
     ));
 
+    // HitGroup
+    HitGroupRecord* hitgroup_records = new HitGroupRecord[hitgroup_datas.size()];
+    // HitGroupRecord用の領域をデバイス側に確保
     CUdeviceptr d_hitgroup_records;
     const size_t hitgroup_record_size = sizeof(HitGroupRecord) * hitgroup_datas.size();
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_hitgroup_records), hitgroup_record_size));
 
-    HitGroupRecord* hitgroup_records = new HitGroupRecord[hitgroup_datas.size()];
+    // HitGroupDataからShader binding tableを構築
     for (size_t i = 0; i < hitgroup_datas.size(); i++)
     {
         ShapeType type = hitgroup_datas[i].first;
         HitGroupData data = hitgroup_datas[i].second;
+        // ShapeTypeに応じてヘッダーを埋めるためのプログラムを切り替える
         if (type == ShapeType::Mesh)
             OPTIX_CHECK(optixSbtRecordPackHeader(state.mesh_hitgroup_prg, &hitgroup_records[i]));
         else if (type == ShapeType::Sphere)
             OPTIX_CHECK(optixSbtRecordPackHeader(state.sphere_hitgroup_prg, &hitgroup_records[i]));
+        // データを設定
         hitgroup_records[i].data = data;
     }
-
+    // HitGroupRecordをデバイス側にコピー
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void*>(d_hitgroup_records),
         hitgroup_records,
@@ -1027,6 +1046,11 @@ void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, Hi
         cudaMemcpyHostToDevice
     ));
 
+    // 今回はCallable プログラムのShader binding tableへのデータ登録は必要ないので、
+    // EmptyRecordを使って空データをコピーする。
+    // ただし、データがない場合でもヘッダーをプログラムで埋める必要がある。
+    // ここを忘れるとレイトレーシング起動後にInvalid memory accessが起きる
+    // デバッグで気づきづらい点なので要注意
     EmptyRecord* callables_records = new EmptyRecord[5];
     CUdeviceptr d_callables_records;
     const size_t callables_record_size = sizeof(EmptyRecord) * 5;
@@ -1045,6 +1069,8 @@ void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, Hi
         cudaMemcpyHostToDevice
     ));
 
+    // 各recordからShader binding tableを構築
+    // ここではrecord配列の先頭へのポインタと、shader binding tableのアラインメント、配列数を設定する
     state.sbt.raygenRecord = d_raygen_record;
     state.sbt.missRecordBase = d_miss_record;
     state.sbt.missRecordStrideInBytes = static_cast<uint32_t>(sizeof(MissRecord));
@@ -1079,7 +1105,7 @@ void finalizeState(OneWeekendState& state)
 // -----------------------------------------------------------------------
 void createScene(OneWeekendState& state)
 {
-    // Return device side pointer of data
+    // デバイス上にデータをコピーして、そのポインタを汎用ポインタで返すlambda関数
     auto copyDataToDevice = [](auto data, size_t size) -> void*
     {
         CUdeviceptr device_ptr;
@@ -1092,21 +1118,37 @@ void createScene(OneWeekendState& state)
         return reinterpret_cast<void*>(device_ptr);
     };
 
-    uint32_t sbt_index = 0;
+    // HitGroupDataとマテリアルデータを格納する配列
+    // 今回の場合は、球・メッシュではそれぞれでジオメトリ用のデータは同じ配列を使用し、
+    // デバイス側でのoptixGetPrimitiveIndex()で交差するデータを切り替えて
+    // マテリアルデータは異なるデータが振り分けられている方式をとっている。
+    // そのため、hitgroup_datasの数はmaterialsの数に合わせる 
+    // <- マテリアルの分だけHitGroupRecordがあれば十分でジオメトリの数用意する必要はない
     std::vector<std::pair<ShapeType, HitGroupData>> hitgroup_datas;
     std::vector<Material> materials;
 
-    // Spheres
+    // --------------------------------------------------------------------
+    // 球体のシーン構築
+    // 球体は全て異なるマテリアルを持っていることとする
+    // --------------------------------------------------------------------
+    // 球体用のデータ準備
     std::vector<SphereData> spheres;
+    // 球体用の相対的なsbt_indexの配列
     std::vector<uint32_t> sphere_sbt_indices;
+    uint32_t sphere_sbt_index = 0;
 
+    // Ground
     SphereData ground_sphere{ make_float3(0, -1000, 0), 1000 };
     spheres.emplace_back(ground_sphere);
+    // テクスチャ
     CheckerData ground_checker{ make_float4(1.0f), make_float4(0.2f, 0.5f, 0.2f, 1.0f), 5000};
+    // Lambertianマテリアル
     LambertianData ground_lambert{ copyDataToDevice(ground_checker, sizeof(CheckerData)), state.checker_prg.id };
     materials.push_back(Material{ copyDataToDevice(ground_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
-    sphere_sbt_indices.emplace_back(sbt_index++);
+    // マテリアルを追加したのでsbt_indexも追加
+    sphere_sbt_indices.emplace_back(sphere_sbt_index++);
     
+    // 疑似乱数用のシード値を生成
     uint32_t seed = tea<4>(0, 0);
     for (int a = -11; a < 11; a++)
     {
@@ -1116,8 +1158,11 @@ void createScene(OneWeekendState& state)
             const float3 center{ a + 0.9f * rnd(seed), 0.2f, b + 0.9f * rnd(seed) };
             if (length(center - make_float3(4, 0.2, 0)) > 0.9f)
             {
+                // 球体を追加
                 spheres.emplace_back( SphereData { center, 0.2f });
-                sphere_sbt_indices.emplace_back(sbt_index++);
+
+                // 確率的にLambertian、Metal、Dielectricマテリアルを作成
+                // 追加する際は型に応じたCallableプログラムIDを割り振る
                 if (choose_mat < 0.8f)
                 {
                     // Lambertian
@@ -1134,11 +1179,12 @@ void createScene(OneWeekendState& state)
                 }
                 else
                 {
-                    // glass
+                    // Dielectric
                     ConstantData albedo{ make_float4(1.0f) };
                     DielectricData glass{ copyDataToDevice(albedo, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f};
                     materials.emplace_back(Material{ copyDataToDevice(glass, sizeof(DielectricData)), state.dielectric_prg.id });
                 }
+                sphere_sbt_indices.emplace_back(sphere_sbt_index++);
             }
         }
     }
@@ -1148,30 +1194,35 @@ void createScene(OneWeekendState& state)
     ConstantData albedo1{ make_float4(1.0f) };
     DielectricData material1{ copyDataToDevice(albedo1, sizeof(ConstantData)), state.constant_prg.id, /* ior = */ 1.5f };
     materials.push_back(Material{ copyDataToDevice(material1, sizeof(DielectricData)), state.dielectric_prg.id });
-    sphere_sbt_indices.emplace_back(sbt_index++);
+    sphere_sbt_indices.emplace_back(sphere_sbt_index++);
 
     // Lambertian
     spheres.emplace_back(SphereData{ make_float3(-4.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo2{ make_float4(0.4f, 0.2f, 0.1f, 1.0f) };
     LambertianData material2{ copyDataToDevice(albedo2, sizeof(ConstantData)), state.constant_prg.id };
     materials.push_back(Material{ copyDataToDevice(material2, sizeof(LambertianData)), state.lambertian_prg.id });
-    sphere_sbt_indices.emplace_back(sbt_index++);
+    sphere_sbt_indices.emplace_back(sphere_sbt_index++);
 
     // Metal
     spheres.emplace_back(SphereData{ make_float3(4.0f, 1.0f, 0.0f), 1.0f });
     ConstantData albedo3{ make_float4(0.7f, 0.6f, 0.5f, 1.0f) };
     MetalData material3{ copyDataToDevice(albedo3, sizeof(ConstantData)), state.constant_prg.id };
     materials.emplace_back(Material{ copyDataToDevice(material3, sizeof(MetalData)), state.metal_prg.id });
-    sphere_sbt_indices.emplace_back(sbt_index++);
+    sphere_sbt_indices.emplace_back(sphere_sbt_index++);
 
-    // Create geometry accleration structure for sphere
+    // Sphere用のGASを作成 (内部で同時にstate.d_sphere_dataへのデータコピーも行っている)
     GeometryAccelData sphere_gas;
     buildSphereGAS(state, sphere_gas, spheres, sphere_sbt_indices);
 
+    // マテリアルと球体データの配列からShader binding table用のデータを用意
     for (auto& m : materials)
         hitgroup_datas.emplace_back(ShapeType::Sphere, HitGroupData{state.d_sphere_data, m});
 
-    // Meshes
+    // --------------------------------------------------------------------
+    // メッシュののシーン構築
+    // メッシュでは100個の三角形に対して割り振るマテリアルは3種類のみ
+    // メッシュデータは全マテリアル共通なので、用意するSBT recordも3つのみでよい
+    // --------------------------------------------------------------------
     std::vector<float3> mesh_vertices;
     std::vector<uint3> mesh_indices;
     std::vector<uint32_t> mesh_sbt_indices;
@@ -1190,40 +1241,42 @@ void createScene(OneWeekendState& state)
         mesh_index += 3;
     }
 
-    const uint32_t red_sbt_index = 0;
-    const uint32_t green_sbt_index = 1;
-    const uint32_t blue_sbt_index = 2;
-
+    // ランダムで赤・緑・青の3色を割り振る
     for (const auto& face : mesh_indices)
     {
         const float choose_rgb = rnd(seed);
         if (choose_rgb < 0.33f)
-            mesh_sbt_indices.push_back(red_sbt_index);
+            mesh_sbt_indices.push_back(mesh_sbt_index++);
         else if (choose_rgb < 0.67f)
-            mesh_sbt_indices.push_back(green_sbt_index);
+            mesh_sbt_indices.push_back(mesh_sbt_index++);
         else
-            mesh_sbt_indices.push_back(blue_sbt_index);
+            mesh_sbt_indices.push_back(mesh_sbt_index++);
     }
 
+    // メッシュ用のGASを作成
     GeometryAccelData mesh_gas;
     buildMeshGAS(state, mesh_gas, mesh_vertices, mesh_indices, mesh_sbt_indices);
 
+    // 赤・緑・青のマテリアルを用意し、HitGroupDataを追加
+    // 赤
     ConstantData red{ {0.8f, 0.05f, 0.05f, 1.0f} };
     LambertianData red_lambert{ copyDataToDevice(red, sizeof(ConstantData)), state.constant_prg.id };
     materials.emplace_back(Material{ copyDataToDevice(red_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
     hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
 
+    // 緑
     ConstantData green{ {0.05f, 0.8f, 0.05f, 1.0f} };
     LambertianData green_lambert{ copyDataToDevice(green, sizeof(ConstantData)), state.constant_prg.id };
     materials.emplace_back(Material{ copyDataToDevice(green_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
     hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
 
+    // 青
     ConstantData blue{ {0.05f, 0.05f, 0.8f, 1.0f} };
     LambertianData blue_lambert{ copyDataToDevice(blue, sizeof(ConstantData)), state.constant_prg.id };
     materials.emplace_back(Material{ copyDataToDevice(blue_lambert, sizeof(LambertianData)), state.lambertian_prg.id });
     hitgroup_datas.emplace_back(ShapeType::Mesh, HitGroupData{ state.d_mesh_data, materials.back() });
 
-    InstanceAccelData scene_ias;
+    // IAS用のInstanceを球体用・メッシュ用それぞれ作成
     std::vector<OptixInstance> instances;
     uint32_t flags = OPTIX_INSTANCE_FLAG_NONE;
 
@@ -1236,6 +1289,7 @@ void createScene(OneWeekendState& state)
 
     sbt_offset += sphere_gas.num_sbt_records;
     instance_id++;
+    // メッシュの方はY軸中心にPI/6だけ回転させる
     const float c = cosf(M_PIf / 6.0f);
     const float s = sinf(M_PIf / 6.0f);
     instances.push_back(OptixInstance{
@@ -1243,8 +1297,10 @@ void createScene(OneWeekendState& state)
         flags, mesh_gas.handle, {0, 0}
     });
 
+    // IASの作成
     buildIAS(state, state.ias, instances);
 
+    // Shader binding tableの作成
     createSBT(state, hitgroup_datas);
 }
 
