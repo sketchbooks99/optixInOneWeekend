@@ -44,28 +44,28 @@ __constant__ Params params;
 //
 //------------------------------------------------------------------------------
 
-struct RadiancePRD
+struct SurfaceInfo
 {
-    float3       emitted;
-    float3       radiance;
-    float3       attenuation;
-    float3       origin;
-    float3       direction;
-    float3       normal; 
-    float2       texcoord;
+    // 発光度
+    float3 emission;
+    // 物体表面の色
+    float3 albedo;
+    // 衝突位置
+    float3 p;
+    // レイの方向
+    float3 direction;
+    // 法線
+    float3 n;
+    // テクスチャ座標
+    float2 texcoord;
 
+    // 乱数のシード値
     unsigned int seed;
-    int          countEmitted;
-    int          done;
-    int          pad;
+    // 光線追跡を終了するか否か
+    int trace_terminate;
 
     // マテリアル用のデータとCallablesプログラムのID
     Material material;
-};
-
-struct SurfaceRecord
-{
-    
 };
 
 //------------------------------------------------------------------------------
@@ -89,12 +89,12 @@ static __forceinline__ __device__ void  packPointer( void* ptr, unsigned int& i0
     i1 = uptr & 0x00000000ffffffff;
 }
 
-
-static __forceinline__ __device__ RadiancePRD* getPRD()
+// 0番目と1番目のペイロードにパックされているSurfaceInfoのポインタを取得
+static __forceinline__ __device__ SurfaceInfo* getSurfaceInfo()
 {
     const unsigned int u0 = optixGetPayload_0();
     const unsigned int u1 = optixGetPayload_1();
-    return reinterpret_cast<RadiancePRD*>( unpackPointer( u0, u1 ) );
+    return reinterpret_cast<SurfaceInfo*>( unpackPointer( u0, u1 ) );
 }
 
 static __forceinline__ __device__ float3 randomInUnitSphere(unsigned int& seed) {
@@ -153,13 +153,12 @@ static __forceinline__ __device__ void trace(
         float3                 ray_direction,
         float                  tmin,
         float                  tmax,
-        RadiancePRD*           prd
+        SurfaceInfo*           si
         )
 {
-    // TODO: deduce stride from num ray-types passed in params
-
+    // SurfaceInfoのポインタを2つのペイロードにパックする
     unsigned int u0, u1;
-    packPointer( prd, u0, u1 );
+    packPointer( si, u0, u1 );
     optixTrace(
             handle,
             ray_origin,
@@ -210,13 +209,11 @@ extern "C" __global__ void __raygen__pinhole()
         float3 ray_direction = normalize(d.x * U + d.y * V + W);
         float3 ray_origin = eye;
 
-        RadiancePRD prd;
-        prd.emitted = make_float3(0.0f);
-        prd.radiance = make_float3(0.0f);
-        prd.attenuation = make_float3(1.0f);
-        prd.countEmitted = true;
-        prd.done = false;
-        prd.seed = seed;
+        SurfaceInfo si;
+        si.emission = make_float3(0.0f);
+        si.albedo = make_float3(0.0f);
+        si.trace_terminate = false;
+        si.seed = seed;
 
         float3 throughput = make_float3(1.0f);
 
@@ -226,22 +223,24 @@ extern "C" __global__ void __raygen__pinhole()
             if (depth >= params.max_depth)
                 break;
 
-            trace(params.handle, ray_origin, ray_direction, 0.01f, 1e16f, &prd);
+            // IASに対してレイトレース
+            trace(params.handle, ray_origin, ray_direction, 0.01f, 1e16f, &si);
 
-            if (prd.done) {
-                result += prd.emitted * throughput;
+            if (si.trace_terminate) {
+                result += si.emission * throughput;
                 break;
             }
 
-            // Direct callable関数を使って各マテリアルにおける
-            optixDirectCall<void, RadiancePRD*, void*>(
-                prd.material.prg_id, &prd, prd.material.data
+            // Direct callable関数を使って各マテリアルにおける散乱方向とマテリアルの色を計算
+            float3 scattered;
+            optixDirectCall<void, SurfaceInfo*, void*, float3&>(
+                si.material.prg_id, &si, si.material.data, scattered
             );
 
-            throughput *= prd.attenuation;
+            throughput *= si.albedo;
 
-            ray_origin = prd.origin;
-            ray_direction = prd.direction;
+            ray_origin = si.p;
+            ray_direction = scattered;
 
             ++depth;
         }
@@ -256,17 +255,22 @@ extern "C" __global__ void __raygen__pinhole()
         const float3 accum_color_prev = make_float3(params.accum_buffer[image_index]);
         accum_color = lerp(accum_color_prev, accum_color, a);
     }
+    // 取得した輝度値を出力バッファに書き込む
     params.accum_buffer[image_index] = make_float4(accum_color, 1.0f);
     params.frame_buffer[image_index] = make_color(accum_color);
 }
 
 extern "C" __global__ void __miss__radiance()
 {
-    RadiancePRD* prd = getPRD();
+    const MissData* miss = (MissData*)optixGetSbtDataPointer();
+
+    SurfaceInfo* si = getSurfaceInfo();
+
+    // ベクトルのy成分から背景色を計算
     const float3 unit_direction = normalize(optixGetWorldRayDirection());
     const float t = 0.5f * (unit_direction.y + 1.0f);
-    prd->emitted = (1.0f - t) * make_float3(1.0f) + t * make_float3(0.5f, 0.7f, 1.0f);
-    prd->done      = true;
+    si->emission = (1.0f - t) * make_float3(1.0f) + t * make_float3(0.5f, 0.7f, 1.0f);
+    si->trace_terminate      = true;
 }
 
 extern "C" __global__ void __closesthit__mesh()
@@ -287,13 +291,13 @@ extern "C" __global__ void __closesthit__mesh()
 
     const float3 P    = optixGetWorldRayOrigin() + optixGetRayTmax()*direction;
 
-    RadiancePRD* prd = getPRD();
+    SurfaceInfo* si = getSurfaceInfo();
 
-    prd->origin = P;
-    prd->direction = direction;
-    prd->normal = N;
-    prd->texcoord = texcoord;
-    prd->material = data->material;
+    si->p = P;
+    si->direction = direction;
+    si->n = N;
+    si->texcoord = texcoord;
+    si->material = data->material;
 }
 
 extern "C" __global__ void __intersection__sphere()
@@ -362,86 +366,85 @@ extern "C" __global__ void __closesthit__sphere()
     const float3 direction = optixGetWorldRayDirection();
     const float3 P = origin + optixGetRayTmax() * direction;
 
-    RadiancePRD* prd = getPRD();
-    prd->origin = P;
-    prd->normal = world_n;
-    prd->direction = direction;
-    prd->texcoord = texcoord;
-    prd->material = data->material;
+    SurfaceInfo* si = getSurfaceInfo();
+    si->p = P;
+    si->n = world_n;
+    si->direction = direction;
+    si->texcoord = texcoord;
+    si->material = data->material;
 }
 
-extern "C" __device__ void __direct_callable__lambertian(RadiancePRD* prd, void* material_data)
+extern "C" __device__ void __direct_callable__lambertian(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const LambertianData* lambertian = (LambertianData*)material_data;
-    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
-        lambertian->texture_prg_id, prd, lambertian->texture_data
+    const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
+        lambertian->texture_prg_id, si, lambertian->texture_data
         );
-    prd->attenuation = make_float3(color);
+    si->albedo = make_float3(color);
 
-    prd->normal = faceforward(prd->normal, -prd->direction, prd->normal);
+    si->n = faceforward(si->n, -si->direction, si->n);
 
-    unsigned int seed = prd->seed;
-    float3 wi = randomSampleHemisphere(seed, prd->normal);
-    prd->direction = normalize(wi);
-    prd->done = false;
-    prd->emitted = make_float3(0.0f);
+    unsigned int seed = si->seed;
+    float3 wi = randomSampleHemisphere(seed, si->n);
+    scattered = normalize(wi);
+    si->trace_terminate = false;
+    si->emission = make_float3(0.0f);
 }
 
-extern "C" __device__ void __direct_callable__dielectric(RadiancePRD* prd, void* material_data)
+extern "C" __device__ void __direct_callable__dielectric(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const DielectricData* dielectric = (DielectricData*)material_data;
-    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
-        dielectric->texture_prg_id, prd, dielectric->texture_data
+    const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
+        dielectric->texture_prg_id, si, dielectric->texture_data
         );
 
     const float ior = dielectric->ior;
-    const float3 in_direction = prd->direction;
+    const float3 in_direction = si->direction;
 
-    prd->attenuation = make_float3(color);
-    float cos_theta = dot(in_direction, prd->normal);
+    si->albedo = make_float3(color);
+    float cos_theta = dot(in_direction, si->n);
     bool into = cos_theta < 0;
-    const float3 outward_normal = into ? prd->normal : -prd->normal;
+    const float3 outward_normal = into ? si->n : -si->n;
     const float refraction_ratio = into ? (1.0 / ior) : ior;
 
     float3 unit_direction = normalize(in_direction);
     cos_theta = fabs(cos_theta);
     float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
 
-    unsigned int seed = prd->seed;
+    unsigned int seed = si->seed;
     bool cannot_refract = refraction_ratio * sin_theta > 1.0;
     if (cannot_refract || rnd(seed) < fresnel(cos_theta, refraction_ratio))
-        prd->direction = reflect(unit_direction, prd->normal);
+        scattered = reflect(unit_direction, si->n);
     else
-        prd->direction = refract(unit_direction, outward_normal, refraction_ratio);
-    prd->done = false;
-    prd->emitted = make_float3(0.0f);
-    prd->seed = seed;
+        scattered = refract(unit_direction, outward_normal, refraction_ratio);
+    si->trace_terminate = false;
+    si->emission = make_float3(0.0f);
+    si->seed = seed;
 }
 
-extern "C" __device__ void __direct_callable__metal(RadiancePRD* prd, void* material_data)
+extern "C" __device__ void __direct_callable__metal(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const MetalData* metal = (MetalData*)material_data;
-    unsigned int seed = prd->seed;
-    prd->direction = reflect(prd->direction, prd->normal) + metal->fuzz * randomInUnitSphere(seed);
-    const float4 color = optixDirectCall<float4, RadiancePRD*, void*>(
-        metal->texture_prg_id, prd, metal->texture_data
+    unsigned int seed = si->seed;
+    scattered = reflect(si->direction, si->n) + metal->fuzz * randomInUnitSphere(seed);
+    const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
+        metal->texture_prg_id, si, metal->texture_data
         );
-    prd->attenuation = make_float3(color);
-    prd->done = false;
-    prd->emitted = make_float3(0.0f);
-    prd->seed = seed;
+    si->albedo = make_float3(color);
+    si->trace_terminate = false;
+    si->emission = make_float3(0.0f);
+    si->seed = seed;
 }
 
-extern "C" __device__ float4 __direct_callable__constant(RadiancePRD* /* prd */ , void* texture_data)
+extern "C" __device__ float4 __direct_callable__constant(SurfaceInfo* /* si */ , void* texture_data)
 {
     const ConstantData* constant = (ConstantData*)texture_data;
     return constant->color;
 }
 
-extern "C" __device__ float4 __direct_callable__checker(RadiancePRD* prd, void* texture_data)
+extern "C" __device__ float4 __direct_callable__checker(SurfaceInfo* si, void* texture_data)
 {
     const CheckerData* checker = (CheckerData*)texture_data;
-    const bool is_odd = sinf(prd->texcoord.x * M_PIf * checker->scale) * sinf(prd->texcoord.y * M_PIf * checker->scale) < 0;
+    const bool is_odd = sinf(si->texcoord.x * M_PIf * checker->scale) * sinf(si->texcoord.y * M_PIf * checker->scale) < 0;
     return is_odd ? checker->color1 : checker->color2;
-
 }

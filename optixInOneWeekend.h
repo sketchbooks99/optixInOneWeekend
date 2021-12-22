@@ -100,7 +100,15 @@ struct MetalData {
 };
 
 struct Material {
+    // マテリアル(Lambertian, Glass, Metal)のデータ
+    // デバイス上に確保されたポインタを紐づけておく
+    // 共用体(union)を使わずに汎用ポインタにすることで、
+    // 異なるデータ型の構造体を追加したいときに対応しやすくなる。
     void* data; 
+
+    // マテリアルにおける散乱方向や色を計算するためのCallablesプログラムのID
+    // OptiX 7.x では仮想関数が使えないので、Callablesプログラムを使って
+    // 疑似的なポリモーフィズムを実現する
     unsigned int prg_id;
 };
 
@@ -120,19 +128,7 @@ struct HitGroupData
 {
     // 物体形状に関するデータ
     // デバイス上に確保されたポインタを紐づける
-    // 共用体を使わずに汎用ポインタにすることで、
-    // 異なるデータ型の構造体を追加したいときに対応しやすくなる。
     void* shape_data;
-
-    //// マテリアル(Lambertian, Glass, Metal)のデータ
-    //// デバイス上に確保されたポインタを紐づけておく
-    //// 物体形状同様に汎用ポインタを使う
-    //void* material_data;
-
-    //// マテリアルにおける散乱方向や色を計算するためのCallablesプログラムのID
-    //// OptiX 7.x では仮想関数が使えないので、Callablesプログラムを使って
-    //// 疑似的なポリモーフィズムを実現する
-    //unsigned int material_prg_id;
 
     Material material;
 };

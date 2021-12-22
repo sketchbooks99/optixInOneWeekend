@@ -96,8 +96,8 @@ using HitGroupRecord = Record<HitGroupData>;
 using EmptyRecord    = Record<EmptyData>;
 
 // Direct/Continuation callable プログラムをデバイス(GPU)側で呼ぶには、
-// OptixDeviceContextが作られてから、Callableプログラムが作られた順番(ID)
-// が必要なので、プログラム作成時にIDを紐づけておく
+// CallablesプログラムのSBT_IDが必要なので、生成順で番号を割り振って起き、
+// その順番でCallables用のSBTを構築するようにする
 struct CallableProgram
 {
     OptixProgramGroup program = nullptr;
@@ -121,6 +121,9 @@ struct InstanceAccelData
 {
     OptixTraversableHandle handle;
     CUdeviceptr d_output_buffer;
+    
+    // IASを構築しているOptixInstanceのデータを更新できるように、
+    // デバイス側のポインタを格納しておく
     CUdeviceptr d_instances_buffer;
 };
 
@@ -486,9 +489,10 @@ uint32_t getNumSbtRecords(const std::vector<uint32_t>& sbt_indices)
 void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& build_input)
 {
     OptixAccelBuildOptions accel_options = {};
-    accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION;
-    accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+    accel_options.buildFlags = OPTIX_BUILD_FLAG_ALLOW_COMPACTION; // ビルド後のCompactionを許可
+    accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;        // ASの更新の際は OPERATION_UPDATE
 
+    // ASのビルドに必要なメモリ領域を計算
     OptixAccelBufferSizes gas_buffer_sizes;
     OPTIX_CHECK( optixAccelComputeMemoryUsage(
         state.context, 
@@ -498,6 +502,7 @@ void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& 
         &gas_buffer_sizes
     ));
 
+    // ASを構築するための一時バッファを確保
     CUdeviceptr d_temp_buffer;
     CUDA_CHECK( cudaMalloc( reinterpret_cast<void**>( &d_temp_buffer ), gas_buffer_sizes.tempSizeInBytes ) );
 
@@ -508,10 +513,12 @@ void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& 
         compacted_size_offset + 8
     ));
 
+    // Compaction後のデータ領域を確保するためのEmit property
     OptixAccelEmitDesc emit_property = {};
     emit_property.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
     emit_property.result = ( CUdeviceptr )( (char*)d_buffer_temp_output_gas_and_compacted_size + compacted_size_offset );
 
+    // ASのビルド
     OPTIX_CHECK(optixAccelBuild(
         state.context,
         state.stream,
@@ -527,18 +534,16 @@ void buildGAS( OneWeekendState& state, GeometryAccelData& gas, OptixBuildInput& 
         1
     ));
 
+    // 一時バッファは必要ないので解放
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp_buffer)));
 
     size_t compacted_gas_size;
     CUDA_CHECK(cudaMemcpy(&compacted_gas_size, (void*)emit_property.result, sizeof(size_t), cudaMemcpyDeviceToHost));
-
-    CUdeviceptr d_gas_output_buffer = 0;
+    // Compaction後の領域が、Compaction前の領域サイズよりも小さい場合のみ Compactionを行う
     if (compacted_gas_size < gas_buffer_sizes.outputSizeInBytes)
     {
         CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gas.d_output_buffer), compacted_gas_size));
-
         OPTIX_CHECK(optixAccelCompact(state.context, 0, gas.handle, gas.d_output_buffer, compacted_gas_size, &gas.handle));
-
         CUDA_CHECK(cudaFree((void*)d_buffer_temp_output_gas_and_compacted_size));
     }
     else
@@ -559,6 +564,7 @@ void buildMeshGAS(
     const std::vector<uint32_t>& sbt_indices
 )
 {
+    // メッシュを構成する頂点情報をGPU上にコピー
     CUdeviceptr d_vertices = 0;
     const size_t vertices_size = vertices.size() * sizeof(float3);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_vertices), vertices_size));
@@ -568,6 +574,7 @@ void buildMeshGAS(
         cudaMemcpyHostToDevice
     ));
 
+    // 頂点のつなぎ方を定義するインデックス情報をGPU上にコピー
     CUdeviceptr d_indices = 0;
     const size_t indices_size = indices.size() * sizeof(uint3);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_indices), indices_size));
@@ -577,12 +584,14 @@ void buildMeshGAS(
         cudaMemcpyHostToDevice 
     ));
     
+    // メッシュデータを構造体に格納し、GPU上にコピー
     MeshData mesh_data{reinterpret_cast<float3*>(d_vertices), reinterpret_cast<uint3*>(d_indices) };
     CUDA_CHECK(cudaMalloc(&state.d_mesh_data, sizeof(MeshData)));
     CUDA_CHECK(cudaMemcpy(
         state.d_mesh_data, &mesh_data, sizeof(MeshData), cudaMemcpyHostToDevice
     ));
 
+    // Instance sbt offsetを基準としたsbt indexの配列をGPUにコピー
     CUdeviceptr d_sbt_indices = 0;
     const size_t sbt_indices_size = sbt_indices.size() * sizeof(uint32_t);
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_sbt_indices), sbt_indices_size));
@@ -592,13 +601,18 @@ void buildMeshGAS(
         cudaMemcpyHostToDevice
     ));
 
+    // 重複のないsbt_indexの個数を数える
     uint32_t num_sbt_records = getNumSbtRecords(sbt_indices);
     gas.num_sbt_records = num_sbt_records;
 
+    // 重複のないsbt_indexの分だけflagsを設定する
+    // Anyhit プログラムを使用したい場合はFLAG_NONE or FLAG_REQUIRE_SINGLE_ANYHIT_CALL に設定する
     uint32_t* input_flags = new uint32_t[num_sbt_records];
     for (uint32_t i = 0; i < num_sbt_records; i++)
         input_flags[i] = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
 
+    // メッシュの頂点情報やインデックスバッファ、SBTレコードのインデックス配列をbuild inputに設定
+    // num_sbt_recordsはあくまでSBTレコードの数で三角形の数でないことに注意
     OptixBuildInput mesh_input = {};
     mesh_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
     mesh_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
@@ -629,10 +643,12 @@ void buildSphereGAS(
     const std::vector<uint32_t>& sbt_indices
 )
 {
+    // Sphereの配列からAABBの配列を作る
     std::vector<OptixAabb> aabb;
     std::transform(spheres.begin(), spheres.end(), std::back_inserter(aabb),
         [](const SphereData& sphere) { return sphereBound(sphere); });
 
+    // AABBの配列をGPU上にコピー
     CUdeviceptr d_aabb_buffer;
     const size_t aabb_size = sizeof(OptixAabb) * aabb.size();
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_aabb_buffer), aabb_size));
@@ -642,6 +658,7 @@ void buildSphereGAS(
         cudaMemcpyHostToDevice
     ));
 
+    // Instance sbt offsetを基準としたsbt indexの配列をGPUにコピー
     CUdeviceptr d_sbt_indices;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_sbt_indices), sizeof(uint32_t) * sbt_indices.size()));
     CUDA_CHECK(cudaMemcpy(
@@ -650,18 +667,24 @@ void buildSphereGAS(
         cudaMemcpyHostToDevice
     ));
 
+    // 全球体データの配列をGPU上にコピー
+    // 個々の球体データへのアクセスはoptixGetPrimitiveIndex()を介して行う
     CUDA_CHECK(cudaMalloc(&state.d_sphere_data, sizeof(SphereData) * spheres.size()));
-    CUDA_CHECK(cudaMemcpy(
-        state.d_sphere_data, spheres.data(), sizeof(SphereData) * spheres.size(), cudaMemcpyHostToDevice
-    ));
+    CUDA_CHECK(cudaMemcpy(state.d_sphere_data, spheres.data(), sizeof(SphereData) * spheres.size(), cudaMemcpyHostToDevice));
 
+    // 重複のないsbt_indexの個数を数える
     uint32_t num_sbt_records = getNumSbtRecords(sbt_indices);
     gas.num_sbt_records = num_sbt_records;
 
+    // 重複のないsbt_indexの分だけflagsを設定する
+    // Anyhit プログラムを使用したい場合はFLAG_NONE or FLAG_REQUIRE_SINGLE_ANYHIT_CALL に設定する
     uint32_t* input_flags = new uint32_t[num_sbt_records];
     for (uint32_t i = 0; i < num_sbt_records; i++)
         input_flags[i] = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
 
+    // Custom primitives用のAABB配列やSBTレコードのインデックス配列を
+    // build input に設定する
+    // num_sbt_recordsはあくまでSBTレコードの数でプリミティブ数でないことに注意
     OptixBuildInput sphere_input = {};
     sphere_input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
     sphere_input.customPrimitiveArray.aabbBuffers = &d_aabb_buffer;
@@ -709,18 +732,26 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
 
     size_t d_temp_buffer_size = ias_buffer_sizes.tempSizeInBytes;
 
-    // Allocate buffer to build acceleration structure
+    // ASを構築するための一時バッファを確保
     CUdeviceptr d_temp_buffer;
     CUDA_CHECK(cudaMalloc(
         reinterpret_cast<void**>(&d_temp_buffer),
         d_temp_buffer_size
     ));
+
+    CUdeviceptr d_buffer_temp_output_ias_and_compacted_size;
+    size_t compacted_size_offset = roundUp<size_t>(ias_buffer_sizes.outputSizeInBytes, 8ull);
     CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&ias.d_output_buffer),
-        ias_buffer_sizes.outputSizeInBytes
+        reinterpret_cast<void**>(&d_buffer_temp_output_ias_and_compacted_size),
+        compacted_size_offset + 8
     ));
 
-    // Build instance AS contains all GASs to describe the scene
+    // Compaction後のデータ領域を確保するためのEmit property
+    OptixAccelEmitDesc emit_property = {};
+    emit_property.type = OPTIX_PROPERTY_TYPE_COMPACTED_SIZE;
+    emit_property.result = ( CUdeviceptr )( (char*)d_buffer_temp_output_ias_and_compacted_size + compacted_size_offset );
+
+    // ASのビルド
     OPTIX_CHECK(optixAccelBuild(
         state.context,
         state.stream,
@@ -729,7 +760,8 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
         1,                  // num build inputs
         d_temp_buffer,
         d_temp_buffer_size,
-        ias.d_output_buffer,
+        // ias.d_output_buffer,
+        d_buffer_temp_output_ias_and_compacted_size,
         ias_buffer_sizes.outputSizeInBytes,
         &ias.handle,        // emitted property list
         nullptr,            // num emitted property
@@ -737,6 +769,19 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
     ));
 
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_temp_buffer)));
+
+    size_t compacted_ias_size;
+    CUDA_CHECK(cudaMemcpy(&compacted_ias_size, (void*)emit_property.result, sizeof(size_t), cudaMemcpyDeviceToHost));
+    if (compacted_ias_size < ias_buffer_sizes.outputSizeInBytes)
+    {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&ias.d_output_buffer), compacted_ias_size));
+        OPTIX_CHECK(optixAccelCompact(state.context, 0, ias.handle, ias.d_output_buffer, compacted_ias_size, &ias.handle));
+        CUDA_CHECK(cudaFree((void*)d_buffer_temp_output_ias_and_compacted_size));
+    }
+    else
+    {
+        ias.d_output_buffer = d_buffer_temp_output_ias_and_compacted_size;
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -747,22 +792,29 @@ void createModule(OneWeekendState& state)
     OptixModuleCompileOptions module_compile_options = {};
     module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
     module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+    // ~7.3 系では OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO
     module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 
     state.pipeline_compile_options.usesMotionBlur = false;
     state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
     state.pipeline_compile_options.numPayloadValues = 2;
+    // Attributeの個数設定
+    // Sphereの交差判定で法線とテクスチャ座標を intersection -> closesthitに渡すので
+    // (x, y, z) ... 3次元、(s, t) ... 2次元 で計5つのAttributeが必要 
+    // optixinOneWeekend.cu:339行目参照
     state.pipeline_compile_options.numAttributeValues = 5;
-#ifdef DEBUG // Enables debug exceptions during optix launches. This may incur significant performance cost and should only be done during development.
+#ifdef DEBUG 
     state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_DEBUG | OPTIX_EXCEPTION_FLAG_TRACE_DEPTH | OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW;
 #else
     state.pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
 #endif
+    // Pipeline launch parameterの変数名
     state.pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
 
     size_t      inputSize = 0;
     const char* input = sutil::getInputData(OPTIX_SAMPLE_NAME, OPTIX_SAMPLE_DIR, "optixInOneWeekend.cu", inputSize);
 
+    // PTXからModuleを作成
     char   log[2048];
     size_t sizeof_log = sizeof(log);
     OPTIX_CHECK_LOG(optixModuleCreateFromPTX(
@@ -1056,11 +1108,11 @@ void createSBT(OneWeekendState& state, const std::vector<std::pair<ShapeType, Hi
     const size_t callables_record_size = sizeof(EmptyRecord) * 5;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_callables_records), callables_record_size));
 
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.lambertian_prg.program, &callables_records[0]));
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.dielectric_prg.program, &callables_records[1]));
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.metal_prg.program, &callables_records[2]));
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.constant_prg.program, &callables_records[3]));
-    OPTIX_CHECK(optixSbtRecordPackHeader(state.checker_prg.program, &callables_records[4]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.lambertian_prg.program, &callables_records[state.lambertian_prg.id]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.dielectric_prg.program, &callables_records[state.dielectric_prg.id]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.metal_prg.program, &callables_records[state.metal_prg.id]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.constant_prg.program, &callables_records[state.constant_prg.id]));
+    OPTIX_CHECK(optixSbtRecordPackHeader(state.checker_prg.program, &callables_records[state.checker_prg.id]));
 
     CUDA_CHECK(cudaMemcpy(
         reinterpret_cast<void*>(d_callables_records),
