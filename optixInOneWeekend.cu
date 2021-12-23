@@ -81,7 +81,7 @@ static __forceinline__ __device__ void* unpackPointer( unsigned int i0, unsigned
     return ptr;
 }
 
-
+// ポインタをunsigned long longに変換してから、前側32bitをi0に、後側32bitをi1に格納する
 static __forceinline__ __device__ void  packPointer( void* ptr, unsigned int& i0, unsigned int& i1 )
 {
     const unsigned long long uptr = reinterpret_cast<unsigned long long>( ptr );
@@ -284,7 +284,7 @@ extern "C" __global__ void __closesthit__mesh()
     // レイと三角形の交点を計算
     const float3 P    = optixGetWorldRayOrigin() + optixGetRayTmax()*direction;
 
-    // PayloadからSurfaceInfoのポインタを取得
+    // PayloadからSurfaceInfoのポインタを取得し、交点上の情報を格納
     SurfaceInfo* si = getSurfaceInfo();
 
     // SurfaceInfoに交点における情報を格納する
@@ -375,7 +375,7 @@ extern "C" __global__ void __closesthit__sphere()
     const float3 direction = optixGetWorldRayDirection();
     const float3 P = origin + optixGetRayTmax() * direction;
 
-    // PayloadからSurfaceInfoのポインタを取得
+    // PayloadからSurfaceInfoのポインタを取得し、交点上の情報を格納
     SurfaceInfo* si = getSurfaceInfo();
     si->p = P;
     si->n = world_n;
@@ -443,7 +443,7 @@ extern "C" __device__ void __direct_callable__metal(SurfaceInfo* si, void* mater
     const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
         metal->texture_prg_id, si, metal->texture_data
         );
-        
+
     unsigned int seed = si->seed;
     scattered = reflect(si->direction, si->n) + metal->fuzz * randomInUnitSphere(seed);
     si->albedo = make_float3(color);
