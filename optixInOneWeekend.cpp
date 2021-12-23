@@ -830,6 +830,35 @@ void createModule(OneWeekendState& state)
 }
 
 // -----------------------------------------------------------------------
+// Direct callable プログラムを生成する。生成するごとにcallable_idを1増やす
+// -----------------------------------------------------------------------
+void createDirectCallables(const OneWeekendState& state, CallableProgram& callable, const char* dc_function_name, uint32_t& callables_id)
+{
+    OptixProgramGroupOptions prg_options = {};
+
+    OptixProgramGroupDesc callables_prg_desc = {};
+
+    char log[2048];
+    size_t sizeof_log = sizeof(log);
+
+    callables_prg_desc.kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
+    callables_prg_desc.callables.moduleDC = state.module;
+    callables_prg_desc.callables.entryFunctionNameDC = dc_function_name;
+    sizeof_log = sizeof(log);
+    OPTIX_CHECK_LOG(optixProgramGroupCreate(
+        state.context,
+        &callables_prg_desc,
+        1,
+        &prg_options,
+        log,
+        &sizeof_log,
+        &callable.program
+    ));
+    callable.id = callables_id;
+    callables_id++;
+}
+
+// -----------------------------------------------------------------------
 // 全ProgramGroupの作成
 // -----------------------------------------------------------------------
 void createProgramGroups(OneWeekendState& state)
@@ -914,43 +943,22 @@ void createProgramGroups(OneWeekendState& state)
     }
 
     uint32_t callables_id = 0;
-    auto createDirectCallables = [&](CallableProgram& callable, const char* dc_function_name)
-    {
-        OptixProgramGroupDesc callables_prg_desc = {};
-
-        callables_prg_desc.kind = OPTIX_PROGRAM_GROUP_KIND_CALLABLES;
-        callables_prg_desc.callables.moduleDC = state.module;
-        callables_prg_desc.callables.entryFunctionNameDC = dc_function_name;
-        sizeof_log = sizeof(log);
-        OPTIX_CHECK_LOG(optixProgramGroupCreate(
-            state.context,
-            &callables_prg_desc,
-            1,
-            &prg_options,
-            log,
-            &sizeof_log,
-            &callable.program
-        ));
-        callable.id = callables_id;
-        callables_id++;
-    };
-
     // マテリアル用のCallableプログラム
     {
         // Lambertian
-        createDirectCallables(state.lambertian_prg, "__direct_callable__lambertian");
+        createDirectCallables(state, state.lambertian_prg, "__direct_callable__lambertian", callables_id);
         // Dielectric
-        createDirectCallables(state.dielectric_prg, "__direct_callable__dielectric");
+        createDirectCallables(state, state.dielectric_prg, "__direct_callable__dielectric", callables_id);
         // Metal
-        createDirectCallables(state.metal_prg, "__direct_callable__metal");
+        createDirectCallables(state, state.metal_prg, "__direct_callable__metal", callables_id);
     }
 
     // テクスチャ用のCallableプログラム
     {
         // Constant texture
-        createDirectCallables(state.constant_prg, "__direct_callable__constant");
+        createDirectCallables(state, state.constant_prg, "__direct_callable__constant", callables_id);
         // Checker texture
-        createDirectCallables(state.checker_prg, "__direct_callable__checker");
+        createDirectCallables(state, state.checker_prg, "__direct_callable__checker", callables_id);
     }
 }
 
@@ -1155,21 +1163,24 @@ void finalizeState(OneWeekendState& state)
 }
 
 // -----------------------------------------------------------------------
+// デバイス上にデータをコピーして、そのポインタを汎用ポインタで返す
+// -----------------------------------------------------------------------
+template <typename T>
+void* copyDataToDevice(T data, size_t size)
+{
+    CUdeviceptr device_ptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_ptr), size));
+    CUDA_CHECK(cudaMemcpy(
+        reinterpret_cast<void*>(device_ptr),
+        &data, size,
+        cudaMemcpyHostToDevice
+    ));
+    return reinterpret_cast<void*>(device_ptr);
+}
+
+// -----------------------------------------------------------------------
 void createScene(OneWeekendState& state)
 {
-    // デバイス上にデータをコピーして、そのポインタを汎用ポインタで返すlambda関数
-    auto copyDataToDevice = [](auto data, size_t size) -> void*
-    {
-        CUdeviceptr device_ptr;
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_ptr), size));
-        CUDA_CHECK(cudaMemcpy(
-            reinterpret_cast<void*>(device_ptr),
-            &data, size,
-            cudaMemcpyHostToDevice
-        ));
-        return reinterpret_cast<void*>(device_ptr);
-    };
-
     // HitGroupDataとマテリアルデータを格納する配列
     // 今回の場合は、球・メッシュではそれぞれでジオメトリ用のデータは同じ配列を使用し、
     // デバイス側でのoptixGetPrimitiveIndex()で交差するデータを切り替えて
@@ -1297,7 +1308,7 @@ void createScene(OneWeekendState& state)
     const uint32_t blue_sbt_index = 2;
 
     // ランダムで赤・緑・青の3色を割り振る
-    for (const auto& face : mesh_indices)
+    for (size_t i = 0; i < mesh_indices.size(); i++)
     {
         const float choose_rgb = rnd(seed);
         if (choose_rgb < 0.33f)
