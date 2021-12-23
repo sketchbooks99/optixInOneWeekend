@@ -98,12 +98,12 @@ static __forceinline__ __device__ SurfaceInfo* getSurfaceInfo()
 }
 
 static __forceinline__ __device__ float3 randomInUnitSphere(unsigned int& seed) {
-    const float phi = 2.0f * M_PIf * rnd(seed);
-    const float theta = acosf(1.0f - 2.0f * rnd(seed));
-    const float x = sinf(theta) * cosf(phi);
-    const float y = sinf(theta) * sinf(phi);
-    const float z = cosf(theta);
-    return make_float3(x, y, z);
+    while (true)
+    {
+        float3 v = make_float3(rnd(seed) * 2.0f - 1.0f, rnd(seed) * 2.0f - 1.0f, rnd(seed) * 2.0f - 1.0f);
+        if (dot(v, v) >= 1.0f) continue;
+        return v;
+    }
 }
 
 static __forceinline__ __device__ float3 randomSampleHemisphere(unsigned int& seed, const float3& normal)
@@ -114,17 +114,6 @@ static __forceinline__ __device__ float3 randomSampleHemisphere(unsigned int& se
     else
         return -vec_in_sphere;
 }
-
-static __forceinline__ __device__ float3 cosineSampleHemisphere(const float u1, const float u2)
-{
-    const float r = sqrtf(u2);
-    const float phi = 2.0f * M_PIf * u1;
-    const float x = r * cosf(phi);
-    const float y = r * sinf(phi);
-    const float z = sqrtf(1.0f - u2);
-    return make_float3(x, y, z);
-}
-
 
 static __forceinline__ __device__ float fresnel(float cosine, float ref_idx)
 {
@@ -275,6 +264,7 @@ extern "C" __global__ void __miss__radiance()
 
 extern "C" __global__ void __closesthit__mesh()
 {
+    // Shader binding tableからデータを取得
     HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
     const MeshData* mesh_data = (MeshData*)data->shape_data;
 
@@ -282,38 +272,49 @@ extern "C" __global__ void __closesthit__mesh()
     const float3 direction         = optixGetWorldRayDirection();
     const uint3 index = mesh_data->indices[prim_idx];
 
+    // 三角形の重心座標(u,v)を三角形のテクスチャ座標とする
     const float2 texcoord = optixGetTriangleBarycentrics();
 
+    // メッシュデータから頂点を取得し、法線計算
     const float3 v0   = mesh_data->vertices[ index.x ];
     const float3 v1   = mesh_data->vertices[ index.y ];
     const float3 v2   = mesh_data->vertices[ index.z ];
     const float3 N  = normalize( cross( v1-v0, v2-v0 ) );
 
+    // レイと三角形の交点を計算
     const float3 P    = optixGetWorldRayOrigin() + optixGetRayTmax()*direction;
 
+    // PayloadからSurfaceInfoのポインタを取得
     SurfaceInfo* si = getSurfaceInfo();
 
+    // SurfaceInfoに交点における情報を格納する
     si->p = P;
     si->direction = direction;
     si->n = N;
     si->texcoord = texcoord;
+    // HitGroupDataに紐付いているマテリアル情報をSurfaceInfoに紐付ける
     si->material = data->material;
 }
 
 extern "C" __global__ void __intersection__sphere()
 {
+    // Shader binding tableからデータを取得
     HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
+    // AABBとの交差判定が認められた球体のGAS内のIDを取得
     const int prim_idx = optixGetPrimitiveIndex();
     const SphereData sphere_data = ((SphereData*)data->shape_data)[prim_idx];
 
     const float3 center = sphere_data.center;
     const float radius = sphere_data.radius;
 
+    // オブジェクト空間におけるレイの原点と方向を取得
     const float3 origin = optixGetObjectRayOrigin();
     const float3 direction = optixGetObjectRayDirection();
+    // レイの最小距離と最大距離を取得
     const float tmin = optixGetRayTmin();
     const float tmax = optixGetRayTmax();
 
+    // 球体との交差判定処理（判別式を解いて、距離tを計算)
     const float3 oc = origin - center;
     const float a = dot(direction, direction);
     const float half_b = dot(oc, direction);
@@ -332,14 +333,17 @@ extern "C" __global__ void __intersection__sphere()
             return;
     }
 
+    // オブジェクト空間におけるレイと球の交点を計算
     const float3 P = origin + root * direction;
     const float3 normal = (P - center) / radius;
 
+    // 球体におけるテクスチャ座標を算出 (Z up)と仮定して、xとyから方位角、zから仰角を計算
     float phi = atan2(normal.y, normal.x);
     if (phi < 0) phi += 2.0f * M_PIf;
     const float theta = acosf(normal.z);
     const float2 texcoord = make_float2(phi / (2.0f * M_PIf), theta / M_PIf);
 
+    // レイと球の交差判定を認める
     optixReportIntersection(root, 0, 
         __float_as_int(normal.x), __float_as_int(normal.y), __float_as_int(normal.z),
         __float_as_int(texcoord.x), __float_as_int(texcoord.y)
@@ -348,35 +352,44 @@ extern "C" __global__ void __intersection__sphere()
 
 extern "C" __global__ void __closesthit__sphere()
 {
+    // Shader binding tableからデータを取得
     HitGroupData* data = (HitGroupData*)optixGetSbtDataPointer();
 
+    // 0 - 2番目のAttributeからIntersectionプログラムで計算した法線を取得
     const float3 local_n = make_float3(
         __int_as_float(optixGetAttribute_0()),
         __int_as_float(optixGetAttribute_1()),
         __int_as_float(optixGetAttribute_2())
     );
+    // Instanceに紐付いている行列からオブジェクト空間における法線をグローバル空間にマップする
     const float3 world_n = normalize(optixTransformNormalFromObjectToWorldSpace(local_n));
 
+    // 3 - 4番目のAttributeからテクスチャ座標を取得
     const float2 texcoord = make_float2(
         __int_as_float(optixGetAttribute_3()),
         __int_as_float(optixGetAttribute_4())
     );
 
+    // グローバル空間におけるレイの原点と方向を計算し、交点座標の位置を計算
     const float3 origin = optixGetWorldRayOrigin();
     const float3 direction = optixGetWorldRayDirection();
     const float3 P = origin + optixGetRayTmax() * direction;
 
+    // PayloadからSurfaceInfoのポインタを取得
     SurfaceInfo* si = getSurfaceInfo();
     si->p = P;
     si->n = world_n;
     si->direction = direction;
     si->texcoord = texcoord;
+    // HitGroupDataに紐付いているマテリアル情報をSurfaceInfoに紐付ける
     si->material = data->material;
 }
 
 extern "C" __device__ void __direct_callable__lambertian(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const LambertianData* lambertian = (LambertianData*)material_data;
+
+    // Direct callableプログラムによって、テクスチャ色を取得
     const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
         lambertian->texture_prg_id, si, lambertian->texture_data
         );
@@ -394,6 +407,7 @@ extern "C" __device__ void __direct_callable__lambertian(SurfaceInfo* si, void* 
 extern "C" __device__ void __direct_callable__dielectric(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const DielectricData* dielectric = (DielectricData*)material_data;
+    // Direct callableプログラムによって、テクスチャ色を取得
     const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
         dielectric->texture_prg_id, si, dielectric->texture_data
         );
@@ -425,11 +439,13 @@ extern "C" __device__ void __direct_callable__dielectric(SurfaceInfo* si, void* 
 extern "C" __device__ void __direct_callable__metal(SurfaceInfo* si, void* material_data, float3& scattered)
 {
     const MetalData* metal = (MetalData*)material_data;
-    unsigned int seed = si->seed;
-    scattered = reflect(si->direction, si->n) + metal->fuzz * randomInUnitSphere(seed);
+    // Direct callableプログラムによって、テクスチャ色を取得
     const float4 color = optixDirectCall<float4, SurfaceInfo*, void*>(
         metal->texture_prg_id, si, metal->texture_data
         );
+        
+    unsigned int seed = si->seed;
+    scattered = reflect(si->direction, si->n) + metal->fuzz * randomInUnitSphere(seed);
     si->albedo = make_float3(color);
     si->trace_terminate = false;
     si->emission = make_float3(0.0f);
