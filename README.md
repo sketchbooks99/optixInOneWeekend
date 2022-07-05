@@ -1,6 +1,6 @@
 # OptixInOneWeekend
 
-このリポジトリは [レイトレ Advent Calendar 2021](https://qiita.com/advent-calendar/2021/raytracing) の12月20日担当分 「[NVIDIA OptiXでRay tracing in One Weekend]()」のサンプルコードです。
+このリポジトリは [レイトレ Advent Calendar 2021](https://qiita.com/advent-calendar/2021/raytracing) の12月20日担当分 「[NVIDIA OptiXでRay tracing in One Weekend](https://qiita.com/sketchbooks99/items/de98db331f8c8d24628c)」のサンプルコードです。
 
 ![result.png](result.png)
 
