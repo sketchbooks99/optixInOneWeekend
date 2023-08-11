@@ -790,10 +790,6 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
 void createModule(OneWeekendState& state)
 {
     OptixModuleCompileOptions module_compile_options = {};
-    //module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-    //module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    //// ~7.3 系では OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO
-    //module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 #if !defined( NDEBUG )
     module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0;
     module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
