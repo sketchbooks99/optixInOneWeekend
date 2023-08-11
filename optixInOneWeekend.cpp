@@ -790,10 +790,14 @@ void buildIAS(OneWeekendState& state, InstanceAccelData& ias, const std::vector<
 void createModule(OneWeekendState& state)
 {
     OptixModuleCompileOptions module_compile_options = {};
-    module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
-    module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
-    // ~7.3 系では OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO
-    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
+    //module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+    //module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+    //// ~7.3 系では OPTIX_COMPILE_DEBUG_LEVEL_LINEINFO
+    //module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
+#if !defined( NDEBUG )
+    module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_LEVEL_0;
+    module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
+#endif
 
     state.pipeline_compile_options.usesMotionBlur = false;
     state.pipeline_compile_options.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_ANY;
@@ -817,6 +821,7 @@ void createModule(OneWeekendState& state)
     // PTXからModuleを作成
     char   log[2048];
     size_t sizeof_log = sizeof(log);
+#if OPTIX_VERSION < 70700
     OPTIX_CHECK_LOG(optixModuleCreateFromPTX(
         state.context,
         &module_compile_options,
@@ -827,6 +832,18 @@ void createModule(OneWeekendState& state)
         &sizeof_log,
         &state.module
     ));
+#else
+    OPTIX_CHECK_LOG(optixModuleCreate(
+        state.context,
+        &module_compile_options,
+        &state.pipeline_compile_options,
+        input,
+        inputSize,
+        log,
+        &sizeof_log,
+        &state.module
+    ));
+#endif
 }
 
 // -----------------------------------------------------------------------
@@ -983,7 +1000,9 @@ void createPipeline(OneWeekendState& state)
     OptixPipelineLinkOptions pipeline_link_options = {};
     // optixTrace()の呼び出し深度の設定
     pipeline_link_options.maxTraceDepth = 2;
+#if OPTIX_VERSION < 70700
     pipeline_link_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_FULL;
+#endif
 
     char log[2048];
     size_t sizeof_log = sizeof(log);
@@ -1000,6 +1019,7 @@ void createPipeline(OneWeekendState& state)
 
     // 各プログラムからパイプラインによって構築されるCall graphのスタックサイズを計算
     OptixStackSizes stack_sizes = {};
+#if OPTIX_VERSION < 70700
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.raygen_prg, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.miss_prg, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.mesh_hitgroup_prg, &stack_sizes));
@@ -1009,6 +1029,17 @@ void createPipeline(OneWeekendState& state)
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.metal_prg.program, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.constant_prg.program, &stack_sizes));
     OPTIX_CHECK(optixUtilAccumulateStackSizes(state.checker_prg.program, &stack_sizes));
+#else
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.raygen_prg, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.miss_prg, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.mesh_hitgroup_prg, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.sphere_hitgroup_prg, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.lambertian_prg.program, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.dielectric_prg.program, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.metal_prg.program, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.constant_prg.program, &stack_sizes, state.pipeline));
+    OPTIX_CHECK(optixUtilAccumulateStackSizes(state.checker_prg.program, &stack_sizes, state.pipeline));
+#endif
 
     uint32_t max_trace_depth = pipeline_link_options.maxTraceDepth;
     // Continuation callableは使用していないので、0でよい
